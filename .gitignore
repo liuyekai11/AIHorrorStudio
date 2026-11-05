@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# 运行产物：本地项目 / 导出视频 / 日志
+projects/
+output/
+*.log
+_*.jsonl
+calls-*.jsonl
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 质量基线的完整 story 与出图（体积大，可随时用 tools/quality_baseline.py 重跑）
+baseline_runs/
+
+# 临时文件
+*.tmp

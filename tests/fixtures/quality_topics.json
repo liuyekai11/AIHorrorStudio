@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "note": "V2.2 固定质量测试题材。模型或 Prompt 更新后，用 tools/quality_compare.py 跑本文件并与 quality_baseline.json 对比。",
+  "topics": [
+    {
+      "id": "hospital",
+      "name": "废弃医院·纸人·雨夜",
+      "keywords": "废弃医院、纸人、雨夜",
+      "style": "中式民俗恐怖",
+      "shot_count": 36,
+      "extra": "结尾要有反转"
+    },
+    {
+      "id": "elevator",
+      "name": "凌晨三点的电梯",
+      "keywords": "凌晨三点的电梯",
+      "style": "日式都市怪谈",
+      "shot_count": 30,
+      "extra": ""
+    },
+    {
+      "id": "mirror",
+      "name": "镜子里的另一个自己",
+      "keywords": "镜子里的另一个自己",
+      "style": "心理惊悚",
+      "shot_count": 32,
+      "extra": "结局留在镜子里的那一刻"
+    }
+  ]
+}
