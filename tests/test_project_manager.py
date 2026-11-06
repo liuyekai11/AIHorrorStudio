@@ -36,6 +36,11 @@ class ProjectManagerTest(unittest.TestCase):
         for sub in ("images", "audio", "subtitles", "output", "temp"):
             self.assertTrue((self.project / sub).is_dir())
         data = self.pm.load(self.project)
+        # V3 P1（MVP 范围 #1）：新建项目的 project.json 为 schema_version=3；
+        # 对 V2 代码保持透明——内存数据（load/migrate 返回）仍是 V2 结构
+        raw = json.loads((self.project / "project.json").read_text(encoding="utf-8"))
+        self.assertEqual(raw["schema_version"], SCHEMA_VERSION + 1)
+        self.assertTrue((self.project / "stories" / "story" / "story.json").exists())
         self.assertEqual(data["schema_version"], SCHEMA_VERSION)
         self.assertEqual(data["shots"], [])
         self.assertEqual(data["settings"]["width"], 1080)

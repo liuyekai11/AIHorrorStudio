@@ -106,10 +106,16 @@ GRADE_LABELS = {"cold": "冷色（恐怖）", "warm": "暖色（复古）", "neu
 PACING_MODES = ("picture", "voice")
 PACING_LABELS = {"picture": "画面优先", "voice": "旁白优先"}
 PROJECT_SUBDIRS = ("images", "audio", "subtitles", "output", "temp", "versions")
+# V3 P1：属于 stories/ 自有文件的字段，project.json 的 story 副本 / 快照里都不保留
+_V3_OWN_KEYS = ("story_id", "project_id", "origin")
 
 
 class ProjectError(Exception):
     """项目相关错误，界面层捕获后提示用户。"""
+
+
+class ProjectReadOnlyError(ProjectError):
+    """未来版本（schema_version > SCHEMA_VERSION）的项目只读，禁止写回。"""
 
 
 def _shot_fingerprint(shot: dict, story_shot: dict | None = None) -> str:
@@ -181,7 +187,48 @@ def parse_time(text: str) -> float:
     return round(total, 3)
 
 
+def _is_v3_data(project: Path, data: dict) -> bool:
+    """写盘时 project.json 的版本号：数据已是 V3、或者磁盘上已经是 V3 项目。"""
+    from modules import v3_storage
+    raw = data.get("schema_version")
+    if raw == v3_storage.V3_SCHEMA_VERSION:
+        return True
+    if raw != SCHEMA_VERSION:
+        return False
+    # 未来版本只读：绝不在磁盘上把版本号写小
+    if ProjectManager._disk_schema_version(project) > v3_storage.V3_SCHEMA_VERSION:
+        return False
+    # 内存数据是 V2 格式（V3 对 V2 代码透明）：磁盘上已经是 V3 时不能写回 2，
+    # 否则 V2 项目的首次「打开即升级」会被下一次保存打回 V2
+    if (Path(project) / v3_storage.V3_LAYOUT_MARKER).exists():
+        return True
+    return ProjectManager._disk_schema_version(project) >= v3_storage.V3_SCHEMA_VERSION
+
+
 class ProjectManager:
+    def __init__(self):
+        # V3 P1：最近一次 load / save 的项目目录。界面里大量「先 load 再 migrate」
+        # 的两次调用写法，靠它让 migrate 里的 V3 hook 知道当前项目。
+        self._v3_project: Path | None = None
+        self._disk_story_version: int = -1      # 最近一次打开项目时磁盘上 story 的结构版本
+        self._opening: bool = False             # 正在 open_project（对账写回允许因只读跳过）
+        self._snapshot_written: bool = False    # 本次打开已写过升级快照
+
+    def _v3_context(self, project: Path):
+        """临时把 V3 上下文指向 project（嵌套调用时恢复原值）。"""
+        from modules import v3_storage
+        outer = v3_storage.Attribution.project
+        self._v3_project = Path(project)
+        if outer is None:
+            v3_storage.Attribution.set_project(Path(project))
+        return outer
+
+    def _v3_restore(self, outer):
+        from modules import v3_storage
+        self._v3_project = None
+        if outer is None:
+            v3_storage.Attribution.restore()
+
     def create_project(self, parent: Path, name: str) -> Path:
         safe_name = sanitize_name(name)
         if not safe_name:
@@ -202,31 +249,98 @@ class ProjectManager:
             "subtitle": None,
             "story": None,
         }
-        self.save(project, data)
+        # V3 P1：主 story 元信息（project.json 的 story 字段仍同步维护，供 V2 兼容）
+        data["stories"] = []
+        data["primary_story_id"] = ""
+        from modules import v3_storage
+        outer = self._v3_context(project)
+        try:
+            vm = v3_storage.V3ProjectManager(project)
+            data = vm.init_primary_story(data=data)
+            if data["schema_version"] == v3_storage.V3_SCHEMA_VERSION:
+                self.save(project, data)
+        except (v3_storage.RepositoryError, OSError):
+            # V3 基础不可用时回退为 V2 项目：保证「创建项目」本身不因 P1 失败
+            data["schema_version"] = SCHEMA_VERSION
+            data["stories"] = []
+            data["primary_story_id"] = ""
+            self.save(project, data)
+        finally:
+            self._v3_restore(outer)
         return project
+
+    @staticmethod
+    def _disk_schema_version(project: Path) -> int:
+        try:
+            raw = json.loads((Path(project) / PROJECT_FILE).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        value = raw.get("schema_version") if isinstance(raw, dict) else None
+        return value if isinstance(value, int) else 0
 
     def open_project(self, project: Path) -> Path:
         project = Path(project)
         if not (project / PROJECT_FILE).exists():
             raise ProjectError("所选目录中没有 project.json，请选择正确的项目文件夹。")
         (project / VERSIONS_DIR).mkdir(parents=True, exist_ok=True)
+        outer = self._v3_context(project)
+        self._opening = True
+        self._snapshot_written = False
+        try:
+            return self._open_project(project)
+        finally:
+            self._opening = False
+            self._v3_restore(outer)
+
+    def _open_project(self, project: Path) -> Path:
+        # 第一步：V3 层的读取时间升级（stories/ 是故事的唯一真源）
         data = self.load(project)
-        migrated, changed = self.migrate(data)
-        due = migrated.pop("_version_snapshot_due", False)
-        if due and migrated.get("story"):
-            # 旧版本 story 升级 / 镜头版本号变化：升级后的结构已存成快照
+        data = self._migrate_with_v3(project, data)
+        due = bool(data.pop("_version_snapshot_due", False))
+        if due and data.get("story") and not self._snapshot_written:
+            # 升级后的结构存一份快照（save_version 会连同 story 一起写盘）
+            self._snapshot_written = True
             try:
-                data = self.migrate(migrated)[0]
+                data = self._migrate_with_v3(project, data)
                 self.save_version(project, data, note="V2.2 结构升级",
                                   official=False)
-                migrated = data
+                return project
             except ProjectError:
                 pass
-        if changed or due:
-            self.save(project, migrated)
         return project
 
+    def _migrate_with_v3(self, project: Path, data: dict) -> dict:
+        """load -> 补版本号 -> migrate(含 V3 对账) -> 有改动就写盘；返回最新数据。"""
+        from modules import v3_storage
+        data = dict(data)
+        story_version = data.pop("story_schema_version", None)
+        if isinstance(story_version, int):
+            self._disk_story_version = story_version
+        # V3 项目对 V2 代码透明（schema_version 报 2）：磁盘上其实是 V3 时补回 3
+        if (project / v3_storage.STORIES_DIR).exists() \
+                and self._disk_schema_version(project) == v3_storage.V3_SCHEMA_VERSION:
+            data["schema_version"] = v3_storage.V3_SCHEMA_VERSION
+        data.pop("_version_snapshot_due", None)
+        migrated, changed = self.migrate(data)
+        due = bool(migrated.pop("_version_snapshot_due", False))
+        # V3：内存里的 story 直接来自 stories/（已是当前结构），磁盘上却是旧结构——
+        # 这正是「旧版本打开时自动升级」，需要存一份结构升级快照
+        due = due or 0 < self._disk_story_version < STORY_SCHEMA_VERSION
+        if due:
+            migrated["_version_snapshot_due"] = True
+        if changed or due:
+            self.save(project, migrated)
+        return migrated
+
     def load(self, project: Path) -> dict:
+        outer = self._v3_context(project)
+        try:
+            return self._load_file(project, merge_v3=True)
+        finally:
+            self._v3_restore(outer)
+
+    @staticmethod
+    def _load_file(project: Path, merge_v3: bool = True) -> dict:
         try:
             with (project / PROJECT_FILE).open("r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -234,12 +348,93 @@ class ProjectManager:
             raise ProjectError(f"project.json 格式损坏：{exc}") from exc
         if isinstance(data, dict):
             data.pop("_version_snapshot_due", None)
+            data.pop("_v3_adopt", None)
+            data.pop("_v3_upgraded", None)
+            if "story_schema_version" in data:
+                # 只由本次 load 记录；内存数据又节省一次写盘（保存时会直接比较）
+                data.pop("story_schema_version", None)
+        if merge_v3 and isinstance(data, dict):
+            from modules import v3_storage
+            disk_version = data.get("schema_version")
+            # 先记住磁盘上 story 的结构版本（V3 对账后可能被骨架覆盖）
+            story = data.get("story")
+            version = story.get("schema_version") if isinstance(story, dict) else None
+            disk_story_version = version if isinstance(version, int) else -1
+            data["story_schema_version"] = disk_story_version
+            if disk_story_version < STORY_SCHEMA_VERSION:
+                # project.json / stories/ 里的故事是旧结构：直接升级并写回（由 open_project
+                # 存升级快照）。V3 对账在第二步进行，不能先被 stories/ 的内容覆盖。
+                if disk_version == v3_storage.V3_SCHEMA_VERSION:
+                    data["schema_version"] = SCHEMA_VERSION
+                return data
+            ProjectManager._merge_v3_story(project, data)
+            if disk_version == v3_storage.V3_SCHEMA_VERSION:
+                # 磁盘是 V3、内存对 V2 代码透明：其余 V2 代码只认识 schema_version=2
+                data["schema_version"] = SCHEMA_VERSION
         return data
 
+    @staticmethod
+    def _merge_v3_story(project: Path, data: dict):
+        """V3 项目：以 stories/<id>/story.json 为准恢复 project.json 的 story 字段。
+
+        只读操作（不改磁盘）；stories/ 缺失或损坏时保持 project.json 原值，交给 migrate 处理。
+        """
+        version = data.get("schema_version")
+        if not isinstance(version, int) or version < SCHEMA_VERSION:
+            return
+        story_id = str(data.get("primary_story_id") or "")
+        if not story_id:
+            return
+        from modules import v3_storage, story_schema
+        try:
+            story = v3_storage.StoryRepository(project).get(story_id)
+        except (v3_storage.RepositoryError, OSError):
+            return
+        if not isinstance(story, dict):
+            return
+        current = data.get("story")
+        if v3_storage.is_valid_story(current) \
+                and not v3_storage.is_valid_story(story):
+            # stories/ 还是空骨架、project.json 有故事：以 project.json 为准
+            # （随后由 V3 层采纳并写回 stories/，见 V3ProjectManager._hydrate）
+            return
+        if story.get("schema_version") != story_schema.SCHEMA_VERSION:
+            # stories/ 还是旧结构（project.json 已是新结构）：以 project.json 为准,
+            # 交给 migrate 升级后写回 stories/，不拿旧结构覆盖
+            return
+        data["story"] = v3_storage.V3ProjectManager.render_story_field(story)
+
     def save(self, project: Path, data: dict):
+        outer = self._v3_context(project)
+        try:
+            self._save(project, data)
+        except ProjectReadOnlyError:
+            # 打开项目时的自动对账写回：项目是未来版本时只读打开，不能因此打不开
+            if not self._opening:
+                raise
+        finally:
+            self._v3_restore(outer)
+
+    def _save(self, project: Path, data: dict):
+        from modules import v3_storage
+        raw = data.get("schema_version")
+        if isinstance(raw, int) and raw > v3_storage.V3_SCHEMA_VERSION:
+            # 未来版本只读：禁止任何写回（包括迁移后的写盘）
+            raise ProjectReadOnlyError(
+                f"项目数据版本 {raw} 高于当前程序支持的 {SCHEMA_VERSION}，"
+                "已按只读方式打开，不能保存。")
+        if self._disk_schema_version(project) > v3_storage.V3_SCHEMA_VERSION:
+            # 磁盘上是未来版本：打开后的对账写回一律跳过（打开即只读，一字不改）
+            return
+        # 写盘路径上以内存里的 story 为准：同步进 stories/（不反过来改写 project.json）
+        v3_storage.sync_story(project, data)
+        disk = data
+        if _is_v3_data(project, data):
+            disk = dict(data)
+            disk["schema_version"] = v3_storage.V3_SCHEMA_VERSION
         tmp = project / (PROJECT_FILE + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(disk, f, ensure_ascii=False, indent=2)
         tmp.replace(project / PROJECT_FILE)
 
     # ------------------------------------------------------------------
@@ -250,6 +445,15 @@ class ProjectManager:
         data = copy.deepcopy(data)
         changed = False
         version_changed = False      # story 结构升级 / 镜头版本号变化：需要存版本快照
+
+        # V3 P1：未来版本（磁盘上 schema_version 更高）只读——不做迁移、不改任何版本号，
+        # 保证打开之后原样写回也不会把磁盘版本号写小
+        project = self._v3_project
+        if project is not None:
+            from modules import v3_storage
+            if self._disk_schema_version(project) > v3_storage.V3_SCHEMA_VERSION:
+                data.pop("_version_snapshot_due", None)
+                return data, False
 
         if not isinstance(data.get("settings"), dict):
             data["settings"] = dict(DEFAULT_SETTINGS)
@@ -281,25 +485,97 @@ class ProjectManager:
             if cleaned != shots:
                 data["shots"] = cleaned
                 changed = True
-            if "schema_version" not in data or data.get("schema_version") != SCHEMA_VERSION:
+            if "schema_version" not in data:
                 changed = True
 
         old_story_version = (data.get("story") or {}).get("schema_version") \
             if isinstance(data.get("story"), dict) else None
+        if "story_schema_version" not in data:
+            # V3 对账需要知道「内存里的 story 是不是本次刚升级的」（load 是只读的）。
+            # 注：内存里的 story 可能已被 load（V3）按磁盘对齐成当前结构，
+            # 真实版本以 load 从磁盘记下的 story_schema_version 为准。
+            data["story_schema_version"] = self._disk_story_version
+        story_upgrade = False
         if self._normalize_story(data):
             changed = True
-            if old_story_version != STORY_SCHEMA_VERSION:
+            # 磁盘上原本是旧结构（load 记录的 story_schema_version）才算「结构升级」
+            if old_story_version != STORY_SCHEMA_VERSION \
+                    and 0 <= self._disk_story_version < STORY_SCHEMA_VERSION:
                 version_changed = True
+                story_upgrade = True
+        if story_upgrade and self._v3_project is not None:
+            # V3 项目里升级后的故事要写回 stories/（否则下次 load 会被旧结构覆盖）
+            data["_v3_adopt"] = data.get("story")
+        data.pop("story_schema_version", None)
         # 注意：migrate() 每次读写都会调用，所以版本快照不能在这里生成
         # （否则每次保存都多一个版本）。升级后由 open_project 存一次快照。
         if version_changed:
             data["_version_snapshot_due"] = True
         if self.reflow(data):
             changed = True
-        if data.get("schema_version") != SCHEMA_VERSION:
-            data["schema_version"] = SCHEMA_VERSION
+        # V3 P1：project.json 的版本号由基础层决定（新项目 = V3，V2 项目保持不变）。
+        if self._v3_load(data):
             changed = True
+        if data.pop("_v3_upgraded", False):
+            # V3 对账时发现磁盘上是旧结构 story、由 stories/ 覆盖：同样需要升级快照
+            data["_version_snapshot_due"] = True
+        from modules import v3_storage
+        if self._v3_project is not None \
+                and (Path(self._v3_project) / v3_storage.STORIES_DIR).exists() \
+                and data.get("schema_version") == v3_storage.V3_SCHEMA_VERSION:
+            # V3 项目对 V2 代码透明：内存里的数据始终报 schema_version=2
+            data["schema_version"] = SCHEMA_VERSION
         return data, changed
+
+    def _v3_load(self, data: dict) -> bool:
+        """调用 V3 基础层：决定 schema_version 并保证有新项目就有主 Story。
+
+        - 没有项目目录（纯内存测试数据）：保持 V2 结构，不做任何 V3 动作；
+        - V2 项目（还没有 stories/）：写盘时一次性初始化主 Story（原有 story 原样
+          带入，没有故事则建空骨架），之后磁盘上就是 V3 项目；
+        - V3 项目：stories/ 是 story 的唯一真源，据此对账。
+
+        返回是否有改动。V3 失败不得让项目打不开，所以这里不抛异常。
+        """
+        from modules import v3_storage
+        project = self._v3_project or v3_storage.Attribution.project
+        if project is not None:
+            project = Path(project)
+            disk = self._disk_schema_version(project)
+            if disk > v3_storage.V3_SCHEMA_VERSION:
+                # 未来版本只读：不改内存版本号、不做任何 V3 初始化 / 对账
+                return False
+        if project is None:
+            if "primary_story_id" not in data and "stories" not in data:
+                # 纯内存数据（从未落盘）：保持 V2 结构原样
+                data["schema_version"] = SCHEMA_VERSION
+                return False
+            # 之前从项目加载过（带主 Story 元信息）：不能把 schema_version 打回 2，
+            # 否则下一次 save 会丢掉 V3 版本号
+            return False
+        if (project / PROJECT_FILE).exists():
+            # 写盘路径上，project.json 的 story 字段与 stories/ 对齐（stories/ 缺失时保持原值）。
+            # _v3_adopt：本次内存里的 story 刚由 migrate 升级 / 由 project.json 采纳，是权威值，
+            # 不能被 stories/ 里的旧内容覆盖（写盘时由 sync_story 写进 stories/）。
+            if not data.get("_v3_adopt"):
+                self._merge_v3_story(project, data)
+        try:
+            vm = v3_storage.V3ProjectManager(project)
+            v3_storage.Attribution.enter("v3")
+            try:
+                result = (vm.init_primary_story(data=data)
+                          if not (project / v3_storage.STORIES_DIR).exists()
+                          else vm.load(data)[0])
+            finally:
+                v3_storage.Attribution.leave()
+            if result is data:
+                return True
+            # V3 层返回的是新 dict：就地覆盖，调用方持有的是原对象
+            data.clear()
+            data.update(result)
+            return True
+        except (v3_storage.RepositoryError, OSError):
+            return False
 
     def _make_shot(self, image: str | None, duration: float = DEFAULT_DURATION) -> dict:
         return {
@@ -516,11 +792,75 @@ class ProjectManager:
         self._normalize_story(data)
         self.save_version(project, data, note=str(story.get("note") or "保存剧本"),
                           official=True)
+        # V3：版本快照生成后再同步到独立 Story（此时 versions 已完整）
+        self._write_v3_story(project, data)
         return data["story"]
+
+    def _write_v3_story(self, project: Path, data: dict):
+        """V3 项目：把 project.json 的 story 同步写进 stories/<id>/story.json。
+
+        V2 项目（project.json 没有主 Story，schema_version=2）不做任何事：
+        P1 阶段 V2 数据格式不变。V3 写入失败不破坏 V2 数据，只记录原因。
+        """
+        from modules import v3_storage
+        story_id = str(data.get("primary_story_id") or "")
+        if not story_id or not isinstance(data.get("story"), dict):
+            return
+        repo = v3_storage.StoryRepository(project)
+        existing = repo.get(story_id)
+        if not isinstance(existing, dict):
+            return
+        payload = copy.deepcopy(data["story"])
+        for key in ("story_id", "project_id", "origin", "created_at"):
+            if key in existing:
+                payload[key] = copy.deepcopy(existing[key])
+        payload["story_id"] = story_id
+        payload["project_id"] = str(data.get("name") or "")
+        try:
+            story = repo.update(story_id, payload)
+            self._sync_v3_story_meta(project, data, story)
+        except (v3_storage.RepositoryError, OSError):
+            pass
+
+    def _sync_v3_story_meta(self, project: Path, data: dict, v3_story: dict | None):
+        """把 V3 story 的版本列表 / 激活版本写回 project.json 的元信息（只增不删）。"""
+        if not v3_story:
+            return
+        entries = []
+        seen = False
+        for entry in data.get("stories") or []:
+            if isinstance(entry, dict) and entry.get("story_id") == v3_story["story_id"]:
+                entry = dict(entry)
+                entry["title"] = v3_story.get("title") or entry.get("title", "")
+                entry["updated_at"] = v3_story.get("updated_at") or entry.get("updated_at", "")
+                entry["shot_count"] = len(v3_story.get("shots") or [])
+                seen = True
+            entries.append(entry)
+        if not seen:
+            entries.append({"story_id": v3_story["story_id"],
+                            "title": v3_story.get("title", "")})
+        data["stories"] = entries
+        self.save(project, data)
 
     def clear_story(self, project: Path):
         data = self.migrate(self.load(project))[0]
         data.pop("story", None)
+        story_id = str(data.get("primary_story_id") or "")
+        if story_id:
+            from modules import v3_storage
+            repo = v3_storage.StoryRepository(project)
+            story = repo.get(story_id)
+            if isinstance(story, dict):
+                # 清空内容但保留主 Story 骨架（项目仍然「有主 Story」）
+                story["shots"] = []
+                story["characters"] = []
+                story["scenes"] = []
+                story["concepts"] = []
+                story["stale"] = {}
+                try:
+                    repo.update(story_id, story)
+                except (v3_storage.RepositoryError, OSError):
+                    pass
         self.save(project, data)
 
     # ------------------------------------------------------------------
@@ -555,6 +895,8 @@ class ProjectManager:
         root = self._versions_root(project)
         root.mkdir(parents=True, exist_ok=True)
         snapshot = copy.deepcopy(story)
+        for key in _V3_OWN_KEYS:      # V3 自有字段只属于 stories/，不进快照
+            snapshot.pop(key, None)
         snapshot.pop("versions", None)
         snapshot.pop("active_version", None)
         snapshot["version_id"] = version_id
@@ -668,6 +1010,9 @@ class ProjectManager:
         restored = copy.deepcopy(story)
         restored["versions"] = [v for v in story["versions"]
                                 if v.get("version_id") != version_id]
+        for key in _V3_OWN_KEYS:
+            if key in data["story"]:
+                restored[key] = data["story"][key]
         data["story"] = restored
         self._normalize_story(data)
         entry = self.save_version(project, data, note=f"恢复自 {version_id}",
