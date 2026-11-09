@@ -427,11 +427,25 @@ class ProjectManager:
             # 磁盘上是未来版本：打开后的对账写回一律跳过（打开即只读，一字不改）
             return
         # 写盘路径上以内存里的 story 为准：同步进 stories/（不反过来改写 project.json）
-        v3_storage.sync_story(project, data)
-        disk = data
-        if _is_v3_data(project, data):
-            disk = dict(data)
-            disk["schema_version"] = v3_storage.V3_SCHEMA_VERSION
+        from modules import v3_storage
+        if (project / PROJECT_FILE).exists():
+            # P1-Fix（P1-02）：保存前统一检查磁盘真实版本（不依赖内存里的 2）
+            try:
+                v3_storage.assert_writable(project, "保存项目")
+            except v3_storage.RepositoryError as exc:
+                if self._opening:
+                    return           # 打开时的自动对账写回：只读直接跳过
+                raise ProjectReadOnlyError(str(exc)) from None
+        try:
+            v3_storage.sync_story(project, data)
+            disk = data
+            if _is_v3_data(project, data):
+                disk = dict(data)
+                disk["schema_version"] = v3_storage.V3_SCHEMA_VERSION
+        except v3_storage.RepositoryError as exc:
+            if self._opening:
+                return
+            raise ProjectReadOnlyError(str(exc)) from None
         tmp = project / (PROJECT_FILE + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(disk, f, ensure_ascii=False, indent=2)
@@ -557,7 +571,28 @@ class ProjectManager:
             # 写盘路径上，project.json 的 story 字段与 stories/ 对齐（stories/ 缺失时保持原值）。
             # _v3_adopt：本次内存里的 story 刚由 migrate 升级 / 由 project.json 采纳，是权威值，
             # 不能被 stories/ 里的旧内容覆盖（写盘时由 sync_story 写进 stories/）。
+            # P1-Fix（P1-03）：写盘前把损坏的 stories/ 文件隔离（原始字节进 .corrupt/）。
+            # 无论内存里的 story 是否已有权威值（_v3_adopt）都要做：否则随后的
+            # sync_story 会用内存数据直接覆盖唯一证据。
+            pid = str(data.get("primary_story_id") or "")
+            story_path = (Path(project) / v3_storage.STORIES_DIR / pid
+                          / v3_storage.STORY_FILE)
+            broken = False
+            try:
+                stored = v3_storage.read_json(story_path)
+                if isinstance(stored, dict) and stored.get("schema_version") != STORY_SCHEMA_VERSION:
+                    # 结构版本不符 = 无法确认内容可用，按损坏隔离
+                    raise v3_storage.CorruptDataError("stories/ 结构版本不符")
+            except v3_storage.CorruptDataError:
+                broken = True
+            except v3_storage.RepositoryError:
+                pass
+            if broken:
+                v3_storage.V3ProjectManager(project)._quarantine_corrupt(story_path)
+                data.pop("_v3_adopt", None)     # 文件已隔离：交给 V3 层按规则恢复
             if not data.get("_v3_adopt"):
+                # _v3_adopt：内存里的 story 刚由 migrate 升级 / 由 project.json 采纳，
+                # 是权威值，不能被 stories/ 里的旧内容覆盖（写盘时由 sync_story 写回）。
                 self._merge_v3_story(project, data)
         try:
             vm = v3_storage.V3ProjectManager(project)
@@ -727,6 +762,11 @@ class ProjectManager:
         story = data.get("story")
         if story is None:
             return False
+        if data.get("_v3_adopt") is not None:
+            # P1-Fix（P1-03）：V3 层刚从 versions/ 恢复出 candidate（写进 story 字段）。
+            # candidate 已由 version snapshot 规范过（shots 是列表），这里再 normalize 会
+            # 把它判坏而丢掉恢复结果——交给 V3 层按 _v3_adopt 写回 stories/。
+            return False
         if not isinstance(story, dict):
             data.pop("story", None)
             return True
@@ -763,6 +803,8 @@ class ProjectManager:
 
     def set_story(self, project: Path, story: dict):
         """保存故事脚本（覆盖旧 story，不动时间轴），并生成一个版本快照。"""
+        from modules import v3_storage
+        v3_storage.assert_writable(project, "保存故事")
         data = self.migrate(self.load(project))[0]
         # 先按旧 story 同步一次（旧项目镜头还没版本号），再换新 story
         old_story = data.get("story") or {}
@@ -803,6 +845,10 @@ class ProjectManager:
         P1 阶段 V2 数据格式不变。V3 写入失败不破坏 V2 数据，只记录原因。
         """
         from modules import v3_storage
+        try:
+            v3_storage.assert_writable(project, "同步 Story")   # P1-02：数据层统一拒写
+        except v3_storage.RepositoryError:
+            return
         story_id = str(data.get("primary_story_id") or "")
         if not story_id or not isinstance(data.get("story"), dict):
             return
@@ -813,6 +859,10 @@ class ProjectManager:
         payload = copy.deepcopy(data["story"])
         for key in ("story_id", "project_id", "origin", "created_at"):
             if key in existing:
+                payload[key] = copy.deepcopy(existing[key])
+        # 版本引用只属于 stories/ 的真源：project.json 的 compatible 副本不强求
+        for key in ("versions", "active_version"):
+            if key in existing and key not in payload:
                 payload[key] = copy.deepcopy(existing[key])
         payload["story_id"] = story_id
         payload["project_id"] = str(data.get("name") or "")
@@ -843,6 +893,8 @@ class ProjectManager:
         self.save(project, data)
 
     def clear_story(self, project: Path):
+        from modules import v3_storage
+        v3_storage.assert_writable(project, "清空故事")
         data = self.migrate(self.load(project))[0]
         data.pop("story", None)
         story_id = str(data.get("primary_story_id") or "")
@@ -888,6 +940,9 @@ class ProjectManager:
         story = data.get("story") or {}
         if not story:
             raise ProjectError("当前没有故事可以存版本。")
+        from modules import v3_storage
+        # P1-Fix（P1-02）：必须在创建任何快照文件之前检查磁盘真实版本
+        v3_storage.assert_writable(project, "保存版本")
         versions = story.get("versions")
         if not isinstance(versions, list):
             versions = story["versions"] = []
@@ -925,36 +980,43 @@ class ProjectManager:
         return entry
 
     def _prune_versions(self, project: Path, data: dict, official_only: bool = True):
-        """删掉超出保留数量的旧快照。被引用的快照不删（保护素材关联）。"""
+        """删掉超出保留数量的旧快照。被引用的快照不删（保护素材关联）。
+
+        P1-Fix（P1-01）：上限只按**正式版本**计数——非正式版本（结构升级快照、
+        「恢复前自动备份」「恢复自 X」）不占正式版本名额，也不会被本次裁剪删除。
+        删除顺序：先删版本文件，成功后才从元信息里移除；文件删不掉（被占用等）
+        就保留该元信息，不让「元数据已删、文件还在（或反之）」静默发生。
+        """
         story = data.get("story") or {}
         versions = story.get("versions") or []
-        active = str(story.get("active_version") or "")
-        candidates = [v for v in versions
-                      if isinstance(v, dict) and (v.get("official") or not official_only)
-                      and v.get("version_id") != active]
-        excess = len(versions) - OFFICIAL_VERSION_LIMIT
+        official = [v for v in versions if isinstance(v, dict) and v.get("official")]
+        excess = len(official) - OFFICIAL_VERSION_LIMIT
         if excess <= 0:
             return
         doomed = []
-        for entry in candidates:          # versions 按时间顺序追加，从最旧的开始
+        for entry in official:            # versions 按时间顺序追加，从最旧的开始
             if len(doomed) >= excess:
                 break
             vid = entry.get("version_id")
             if self._version_referenced(project, data, vid):
-                continue
+                continue                  # 活动版本 / base 链 / 素材引用的版本不删
             doomed.append(entry)
-        if not doomed:
-            return
+        removed = set()
         for entry in doomed:
-            path = self._version_file(project, entry.get("version_id", ""))
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        doomed_ids = {e.get("version_id") for e in doomed}
+            vid = entry.get("version_id", "")
+            path = self._version_file(project, vid)
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    # 文件删不掉：保留元信息，下次保存再试，不产生悬空引用
+                    continue
+            removed.add(vid)
+        if not removed:
+            return
         story["versions"] = [v for v in versions
                              if not (isinstance(v, dict)
-                                     and v.get("version_id") in doomed_ids)]
+                                     and v.get("version_id") in removed)]
 
     def _version_referenced(self, project: Path, data: dict, version_id: str) -> bool:
         """版本是否仍被引用：激活版本 / 其它版本的 base 链 / 时间轴素材记录。"""
@@ -993,6 +1055,8 @@ class ProjectManager:
 
     def restore_version(self, project: Path, version_id: str) -> dict:
         """恢复到指定版本。当前状态先存成快照（可再切回），恢复后可回滚。"""
+        from modules import v3_storage
+        v3_storage.assert_writable(project, "恢复版本")   # 改 Story 之前先拒
         data = self.migrate(self.load(project))[0]
         snapshot = self.load_version(project, version_id)
         before = self.save_version(project, data, note="恢复前自动备份",

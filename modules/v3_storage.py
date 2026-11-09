@@ -12,6 +12,7 @@ V3 设计权威见 docs/architecture/v3_stage0/。本模块只落地 P1 需要�
 """
 import json
 import os
+import shutil
 import time
 import uuid
 from datetime import datetime
@@ -35,6 +36,14 @@ _TMP_SUFFIX = ".tmp"
 
 class RepositoryError(Exception):
     """数据层错误：调用方捕获后提示用户，不得静默继续。"""
+
+
+class CorruptDataError(RepositoryError):
+    """文件存在但内容损坏（不是合法 JSON）。
+
+    区别于「暂时读不了」（占用 / 权限）：只有确认损坏才进入 P1-03 的恢复流程，
+    避免把暂时被锁的好文件当作损坏覆盖。
+    """
 
 
 # ----------------------------------------------------------------------
@@ -102,7 +111,7 @@ def read_json(path, default=None):
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
-        raise RepositoryError(f"{path.name} 格式损坏：{exc}") from exc
+        raise CorruptDataError(f"{path.name} 格式损坏：{exc}") from exc
 
 
 def cleanup_stale_temps(root):
@@ -259,6 +268,38 @@ class Repository:
 
 
 # ----------------------------------------------------------------------
+# 未来版本只读保护（P1-Fix / P1-02）
+# ----------------------------------------------------------------------
+#: 写入检查看到的实际磁盘版本（测试与排障用；只记录，不参与判定）
+_last_write_check: dict = {}
+
+
+def assert_writable(project, what: str = "项目数据"):
+    """任何业务数据写入前的统一检查：**只看磁盘上 project.json 的真实版本号**。
+
+    - 磁盘版本 > V3_SCHEMA_VERSION（未来版本）：拒绝写入，抛 RepositoryError；
+    - 其余情况（2 / 3 / 文件损坏）照常放行，老逻辑负责迁移与容错；
+    - 不读内存里的 schema_version：V3 对 V2 代码透明时内存恒为 2，不能作为依据。
+    """
+    project = Path(project)
+    path = project / "project.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # 还没落盘 / 读不了 / 损坏：都不是「未来版本」，放行，
+        # 由老逻辑负责初始化、迁移与损坏报告（不能因此挡住项目创建）
+        return
+    version = raw.get("schema_version") if isinstance(raw, dict) else None
+    if not isinstance(version, int):
+        return
+    _last_write_check[project] = version
+    if version > V3_SCHEMA_VERSION:
+        raise RepositoryError(
+            f"{what}：项目数据版本 {version} 高于当前程序支持的 {V3_SCHEMA_VERSION}，"
+            "已按只读方式打开，拒绝写入。")
+
+
+# ----------------------------------------------------------------------
 # Story 独立持久化
 # ----------------------------------------------------------------------
 class StoryRepository(Repository):
@@ -301,6 +342,7 @@ class StoryRepository(Repository):
 
     def rebuild_index(self) -> dict:
         """从目录扫描重建 index.json（唯一天真源是 stories/*/story.json）。"""
+        assert_writable(self.project, "重建 Story 索引")
         entries = []
         root = self.stories_root()
         if root.exists():
@@ -320,6 +362,7 @@ class StoryRepository(Repository):
         return index
 
     def _sync_index(self, story: dict):
+        assert_writable(self.project, "更新 Story 索引")
         index = None
         try:
             index = read_json(self._index_file())
@@ -362,6 +405,7 @@ class StoryRepository(Repository):
         return result
 
     def create(self, story: dict) -> dict:
+        assert_writable(self.project, "新建 Story")
         story = _clone(story)
         story_id = _validate_id(story.get("story_id"), "story_id")
         if self.exists(story_id):
@@ -373,6 +417,7 @@ class StoryRepository(Repository):
 
     def update(self, story_id: str, story: dict) -> dict:
         """整体覆盖写入（调用方负责先 read-modify）。story_id 不允许改变。"""
+        assert_writable(self.project, "保存 Story")
         story_id = _validate_id(story_id, "story_id")
         if not self.exists(story_id):
             raise RepositoryError(f"story 不存在：{story_id}")
@@ -387,6 +432,7 @@ class StoryRepository(Repository):
 
     def archive(self, story_id: str) -> Path:
         """归档（不直接删除）：整个 story 目录移动到项目外 .trash/。"""
+        assert_writable(self.project, "归档 Story")
         folder = self.story_dir(story_id)
         if not folder.exists():
             raise RepositoryError(f"story 不存在：{story_id}")
@@ -429,6 +475,7 @@ class VersionStore(Repository):
 
     def snapshot(self, story_id: str, note: str = "", official: bool = True) -> dict:
         """把当前 story 存成快照，并把版本条目追加到 story["versions"]。"""
+        assert_writable(self.project, "创建版本快照")
         story = self.stories.get(story_id)
         if not isinstance(story, dict):
             raise RepositoryError(f"story 不存在：{story_id}")
@@ -496,6 +543,7 @@ class VersionStore(Repository):
 
     def restore(self, story_id: str, version_id: str) -> dict:
         """恢复到指定版本；恢复前先备份当前状态（回到旧状态可再切回）。"""
+        assert_writable(self.project, "恢复版本")
         snapshot = self.load(version_id)
         if str(snapshot.get("story_id") or story_id) != str(story_id):
             raise RepositoryError("版本不属于该 story")
@@ -527,6 +575,12 @@ class TaskStore(Repository):
 
     只是持久化基础（用于崩溃后诊断与 UI 展示），不替代现有的线程调度。
     mark_abandoned() 用于识别上次进程异常退出时残留的 running 记录。
+
+    未来版本只读边界（P1-02，审查报告 §8）：`.tasks/` 是运行任务的**过程**元数据，
+    不是项目业务数据（不影响 Project / Story 的内容与版本号），因此与 P1 审查结论
+    保持一致——不纳入未来版本只读保护：只读打开的项目仍可记录「某个任务尝试运行过」。
+    唯一例外是 mark_abandoned()：它代表一次项目级的写操作（启动恢复），调用方应
+    在项目只读时跳过它。
     """
 
     def __init__(self, project: Path):
@@ -534,6 +588,7 @@ class TaskStore(Repository):
 
     def mark_abandoned(self, note: str = "上次运行未正常结束") -> int:
         """把所有残留的 running 记录标成 failed（进程崩溃后调用）。返回修改数量。"""
+        assert_writable(self.project, "恢复任务状态")
         count = 0
         for record in self.list():
             if record.get("status") != "running":
@@ -552,6 +607,7 @@ class TaskStore(Repository):
         return self._root() / f"{_validate_id(task_id, 'task_id')}.json"
 
     def start(self, kind: str, note: str = "", task_id: str | None = None) -> dict:
+        assert_writable(self.project, "记录任务状态")
         stamp = _now()
         record = {
             "task_id": task_id or uuid.uuid4().hex[:12],
@@ -569,6 +625,7 @@ class TaskStore(Repository):
         return read_json(self._file(task_id))
 
     def finish(self, task_id: str, status: str, error: str = "") -> dict:
+        assert_writable(self.project, "更新任务状态")
         if status not in TASK_STATUSES:
             raise RepositoryError(f"未知任务状态：{status}")
         record = read_json(self._file(task_id))
@@ -668,6 +725,10 @@ class V3ProjectManager(Repository):
             return data, False
         try:
             story = self.get_primary_story()
+        except CorruptDataError:
+            # P1-03：stories/ 损坏。project.json 有效 → 备份损坏文件后从 project.json 恢复；
+            # 两侧都无效 → 抛错进入人工恢复，绝不用空骨架覆盖
+            return self._recover_corrupt_story(data)
         except RepositoryError:
             story = None
         if version == 2:
@@ -686,9 +747,130 @@ class V3ProjectManager(Repository):
         if is_valid_story(data.get("story")):
             self._assign_primary(data)
             return data, True
+        # P1-03：两侧都拿不到有效 Story。先看 versions/ 里有没有可恢复的候选；
+        # 没有就抛明确错误并保留全部原始字节，不做任何覆盖。
+        candidate = self._recoverable_version(data)
+        if candidate is not None:
+            data["story"] = candidate
+            data["_v3_adopt"] = candidate
+            self._assign_primary(data)
+            return data, True
         raise RepositoryError(
-            "V3 项目缺少主 Story，且 project.json 中也没有可恢复的故事。"
-            "项目已按损坏处理，请从 versions/ 手工恢复或联系维护者。")
+            "V3 项目缺少主 Story，project.json 中也没有可恢复的故事，"
+            f"versions/ 中没有可用快照。已按损坏处理：原文件未做任何修改，"
+            "请从 .corrupt/ 备份或 versions/ 手工恢复后重试。")
+
+    @staticmethod
+    def _usable_project_story(data: dict) -> dict | None:
+        """project.json 里的 story 是否可直接采纳：有效且 shots 是镜头列表。
+
+        is_valid_story 只要求 shots 非空；「shots: 'not-a-list'」这类结构损坏
+        也可能被判为有效，采纳后会把坏数据写回 stories/。
+        """
+        story = data.get("story")
+        if not is_valid_story(story) or not isinstance(story.get("shots"), list):
+            return None
+        return story
+
+    def _recoverable_version(self, data: dict) -> dict | None:
+        """两侧 Story 都无效时，从 versions/ 找一个可用的恢复候选（只读）。
+
+        按 story["versions"] 记录的顺序（新的在前）找第一个可加载且内容有效的快照；
+        没有版本记录时扫 versions/ 目录按文件名倒序。只挑候选，不写盘——
+        写盘由随后的 _v3_adopt 流程完成，失败不会破坏任何原文件。
+        """
+        vid = ""
+        candidates = []
+        story = data.get("story") if isinstance(data.get("story"), dict) else {}
+        for entry in story.get("versions") or []:
+            if isinstance(entry, dict) and entry.get("version_id"):
+                candidates.append(str(entry["version_id"]))
+        if not candidates:
+            root = self.project / VERSIONS_DIR
+            if root.exists():
+                candidates = sorted(
+                    (p.stem for p in root.glob("*.json")
+                     if not p.name.startswith(".")),
+                    reverse=True)
+        for vid in candidates:
+            try:
+                snapshot = read_json(self.version_file_path(vid))
+            except RepositoryError:
+                continue
+            if isinstance(snapshot, dict) and snapshot.get("shots"):
+                payload = _clone(snapshot)
+                for key in _OWN_KEYS:
+                    payload.pop(key, None)
+                payload.pop("version_id", None)
+                payload.pop("note", None)
+                payload.pop("official", None)
+                payload.pop("created_at", None)
+                return payload
+        return None
+
+    def version_file_path(self, version_id: str) -> Path:
+        """versions/<version_id>.json（P1-Fix：供恢复候选读取）。"""
+        return self.project / VERSIONS_DIR / f"{_validate_id(version_id, 'version_id')}.json"
+
+    def _quarantine_corrupt(self, path: Path) -> Path | None:
+        """把损坏文件的原始字节搬到 .corrupt/（不删除、不覆盖）。返回备份路径。"""
+        path = Path(path)
+        try:
+            if not path.exists():
+                return None
+            root = self.project / ".corrupt"
+            root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            target = root / f"{path.name}.{stamp}.bak"
+            shutil.copy2(path, target)
+            path.unlink()
+            return target
+        except OSError:
+            return None
+
+    def _recover_corrupt_story(self, data: dict) -> tuple[dict, bool]:
+        """P1-03 规则 2/3：stories/ 损坏时的安全恢复。
+
+        - project.json 的 story 有效（shots 为列表）→ 备份损坏文件（保原始字节）后采纳；
+        - 两侧都不可用 → 先试 versions/，再抛 CorruptDataError（保留全部原始字节）。
+        - project.json 有镜头但结构坏 → 已损坏数据，绝不当作「没故事」，直接人工恢复。
+        「不可用但非空」必须在任何候选/骨架写入之前判定，否则可用快照会盖掉坏数据。
+        """
+        current = self._usable_project_story(data)   # 有效且 shots 为列表才算可用
+        pid = str(data.get("primary_story_id") or PRIMARY_STORY_ID)
+        story_path = self.stories.story_file(pid)
+        broken = story_path.exists()
+
+        def quarantine() -> None:
+            if broken and self._quarantine_corrupt(story_path) is None:
+                # 备份失败就不能动原文件（否则丢唯一证据），明确报错交人工处理
+                raise RepositoryError(
+                    f"stories/{pid}/story.json 损坏，且备份损坏文件失败。"
+                    "为避免丢失原始数据，未做任何修改，请手工处理。")
+
+        if current is not None:
+            quarantine()
+            data["_v3_adopt"] = current
+            return data, True
+        candidate = self._recoverable_version(data)
+        if candidate is not None:
+            quarantine()
+            data["story"] = candidate
+            data["_v3_adopt"] = candidate
+            self._assign_primary(data)
+            return data, True
+        if is_valid_story(data.get("story")):
+            # 有镜头但结构坏（如 shots 不是列表）：已损坏、不可用，也绝不是空项目。
+            # 走人工恢复，不用任何候选或空骨架覆盖。
+            quarantine()
+            raise CorruptDataError(
+                f"stories/{pid}/story.json 损坏/缺失，project.json 中的 story 结构无效、"
+                "无法恢复。损坏文件已按原字节备份到 .corrupt/，未被覆盖。"
+                "请手工检查后从备份恢复。")
+        raise CorruptDataError(
+            f"stories/{pid}/story.json 损坏/缺失，且 project.json 中没有可恢复的故事，"
+            "versions/ 中也没有可用快照。原文件未做任何修改（字节完整保留），"
+            "请手工检查 .trash/、.corrupt/ 或备份。")
 
     def _hydrate(self, data: dict, story: dict, *, version: int) -> tuple[dict, bool]:
         changed = False
@@ -738,15 +920,17 @@ class V3ProjectManager(Repository):
             # 本次内存里的 story 是权威值（刚由 project.json 采纳 / 刚升级）：保留，
             # 不拿 stories/ 里可能过时的内容覆盖（写盘时 sync_story 会写回 stories/）
             return data, changed
-        if version == 3 and not is_valid_story(story) \
-                and not is_valid_story(current) \
-                and not self.stories.exists(story["story_id"]):
-            # 主 Story 已被归档（骨架还在但文件已移走）：项目不能没有主 Story，先重建
-            try:
-                self.init_primary_story(project=self.project)
-            except (RepositoryError, OSError):
-                raise RepositoryError(f"主 Story 文件缺失：{story['story_id']}")
-            story = self.stories.get(story["story_id"]) or story
+        if version == 3 and not is_valid_story(story):
+            # P1-03：stories/ 是空骨架 / 已被归档，project.json 也没有有效故事。
+            # 放弃旧版「init_primary_story 重建」——那会用刚被清空的 project.json
+            # 写一个空 Story，覆盖唯一副本。改为 versions/ 候选 > 保持现状。
+            if not is_valid_story(current):
+                candidate = self._recoverable_version(data)
+                if candidate is not None:
+                    data["story"] = candidate
+                    data["_v3_adopt"] = candidate
+                    changed = True
+            return data, changed
         theirs = (self.render_story_field(story)
                   if is_valid_story(story) else None)
         if current is None or not is_valid_story(current):

@@ -236,8 +236,7 @@ class IntegrityTest(_Base):
         vm = v3.V3ProjectManager(project)
         with self.assertRaises(v3.RepositoryError):
             vm.load(dict(raw))
-        # 项目仍然可以打开（V3 失败不能挡住 V2 界面）
-        self.assertIsNone(self.pm.get_story(self.pm.load(project)))
+        self.assertEqual(self.pm.get_story(self.pm.load(project)), raw["story"])
 
     def test_corrupt_story_file_does_not_lose_project(self):
         project = self._project()
@@ -399,6 +398,292 @@ class V2CompatibilityTest(_Base):
         self.assertEqual(len(files), 1)
         self.pm.open_project(project)
         self.assertEqual(len(list((project / "versions").glob("*.json"))), 1)
+
+
+class P1FixVersionPruneTest(_Base):
+    """P1-Fix / P1-01：正式版本裁剪只按正式版本计数。"""
+
+    def _story_with_shot(self):
+        s = _story(n=2)
+        return s
+
+    def _official(self, project):
+        story = json.loads((project / "stories" / "story" / "story.json").read_text("utf-8"))
+        return [v for v in story.get("versions") or [] if v.get("official")]
+
+    def test_unofficial_versions_do_not_consume_official_quota(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))           # 1 个正式
+        for i in range(9):                                 # + 9 个非正式
+            self.pm.save_version(project, self.pm.load(project),
+                                 note=f"非正式{i}", official=False)
+        self.assertEqual(len(self._official(project)), 1)
+        self.pm.save_version(project, self.pm.load(project), note="再存", official=False)
+        # 正式版本仍在（修复前会被裁掉）
+        self.assertEqual(len(self._official(project)), 1)
+
+    def test_official_versions_pruned_at_limit(self):
+        project = self._project()
+        for i in range(13):
+            self.pm.set_story(project, _story(title=f"第{i}版", n=2))
+        official = self._official(project)
+        self.assertEqual(len(official), 10)
+        story = json.loads((project / "stories/story/story.json").read_text("utf-8"))
+        self.assertEqual(story["title"], "第12版")
+        for entry in official:                              # 元信息引用的文件都还在
+            self.assertTrue((project / entry["file"]).exists())
+
+    def test_active_version_never_pruned(self):
+        project = self._project()
+        self.pm.set_story(project, _story(title="A", n=2))
+        active = self._official(project)[0]["version_id"]
+        data = self.pm.load(project)
+        data["story"]["active_version"] = active
+        self.pm.save(project, data)
+        for i in range(12):
+            self.pm.save_version(project, self.pm.load(project), note=f"x{i}", official=True)
+        story = json.loads((project / "stories/story/story.json").read_text("utf-8"))
+        self.assertEqual(story["active_version"], active)      # 引用没有丢失
+        ids = {v["version_id"] for v in self._official(project)}
+        self.assertIn(active, ids)                              # 也不被裁剪
+        self.assertTrue((project / "versions" / f"{active}.json").exists())
+
+    def test_referenced_version_never_pruned(self):
+        project = self._project()
+        self.pm.set_story(project, _story(title="被引用", n=2))
+        keep = self._official(project)[0]["version_id"]
+        data = self.pm.load(project)
+        data["shots"] = [{"id": "abc12345", "image": None, "start": 0.0, "duration": 3.0,
+                          "zoom": "none", "motion": "static", "transition": "cut",
+                          "subtitle": None, "voiced": True, "voice_version": keep}]
+        self.pm.save(project, data)
+        for i in range(14):
+            self.pm.set_story(project, _story(title=f"第{i}版", n=2))
+        ids = {v["version_id"] for v in self._official(project)}
+        self.assertIn(keep, ids)
+
+    def test_prune_keeps_metadata_when_file_delete_fails(self):
+        project = self._project()
+        for i in range(12):
+            self.pm.set_story(project, _story(title=f"第{i}版", n=2))
+        before = self._official(project)
+        with mock.patch.object(Path, "unlink", side_effect=OSError("被占用")):
+            self.pm.set_story(project, _story(title="新的一版", n=2))
+        official = self._official(project)
+        # 删不掉的文件：元信息保留（不产生悬空引用），版本数量只增不减
+        for entry in official:
+            self.assertTrue((project / entry["file"]).exists())
+        kept = {v["version_id"] for v in before}
+        self.assertTrue(kept.issubset({v["version_id"] for v in official}))
+
+
+class P1FixFutureVersionTest(_Base):
+    """P1-Fix / P1-02：所有业务数据写入入口在 schema_version=4 时都拒绝。"""
+
+    def _future_project(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        raw = self._raw(project)
+        raw["schema_version"] = v3.V3_SCHEMA_VERSION + 1
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        return project
+
+    def _snapshot(self, project):
+        def dump(root):
+            out = {}
+            for path in sorted(Path(root).rglob("*")):
+                if path.is_file():
+                    out[str(path.relative_to(project))] = path.read_bytes()
+            return out
+        return dump(project)
+
+    def _assert_untouched(self, project, before):
+        self.assertEqual(self._snapshot(project), before)
+
+    def _entries(self, project):
+        data = self.pm.load(project)
+        return data, v3.StoryRepository(project), v3.VersionStore(project)
+
+    def test_save_refused(self):
+        project = self._future_project()
+        before = self._snapshot(project)
+        data = self.pm.load(project)
+        with self.assertRaises((ProjectReadOnlyError, v3.RepositoryError)):
+            self.pm.save(project, data)
+        self._assert_untouched(project, before)
+
+    def test_save_version_refused_before_snapshot_file(self):
+        project = self._future_project()
+        before = self._snapshot(project)
+        data = self.pm.load(project)
+        with self.assertRaises((ProjectReadOnlyError, v3.RepositoryError)):
+            self.pm.save_version(project, data, note="x")
+        self._assert_untouched(project, before)      # 不能留下新快照文件
+
+    def test_restore_version_refused(self):
+        project = self._future_project()
+        vid = json.loads((project / "stories/story/story.json").read_text("utf-8"))[
+            "versions"][0]["version_id"]
+        before = self._snapshot(project)
+        with self.assertRaises((ProjectReadOnlyError, v3.RepositoryError)):
+            self.pm.restore_version(project, vid)
+        self._assert_untouched(project, before)
+
+    def test_set_and_clear_story_refused(self):
+        project = self._future_project()
+        before = self._snapshot(project)
+        with self.assertRaises((ProjectReadOnlyError, v3.RepositoryError)):
+            self.pm.set_story(project, _story(title="不该写入", n=2))
+        self._assert_untouched(project, before)
+        with self.assertRaises((ProjectReadOnlyError, v3.RepositoryError)):
+            self.pm.clear_story(project)
+        self._assert_untouched(project, before)
+
+    def test_story_repository_refused(self):
+        project = self._future_project()
+        before = self._snapshot(project)
+        repo = v3.StoryRepository(project)
+        story = repo.get("story")
+        with self.assertRaises(v3.RepositoryError):
+            repo.update("story", dict(story, title="不改"))
+        self._assert_untouched(project, before)
+        with self.assertRaises(v3.RepositoryError):
+            repo.create(dict(story, story_id="second"))
+        self._assert_untouched(project, before)
+        with self.assertRaises(v3.RepositoryError):
+            repo.archive("story")
+        self._assert_untouched(project, before)
+
+    def test_version_store_refused(self):
+        project = self._future_project()
+        before = self._snapshot(project)
+        store = v3.VersionStore(project)
+        vid = store.list("story")[0]["version_id"]
+        with self.assertRaises(v3.RepositoryError):
+            store.snapshot("story", note="x")
+        with self.assertRaises(v3.RepositoryError):
+            store.restore("story", vid)
+        self._assert_untouched(project, before)
+
+    def test_init_primary_story_refused(self):
+        project = self._future_project()
+        before = self._snapshot(project)
+        raw = self._raw(project)
+        with self.assertRaises(v3.RepositoryError):
+            v3.V3ProjectManager(project).init_primary_story(data=raw)
+        self._assert_untouched(project, before)
+
+    def test_normal_v3_project_still_writable(self):
+        project = self._project()
+        self.pm.set_story(project, _story(title="正常", n=2))
+        data = self.pm.load(project)
+        data["story"]["title"] = "正常改"
+        self.pm.save(project, data)
+        self.pm.save_version(project, self.pm.load(project), note="正常版本")
+        self.assertEqual(self.pm.load(project)["story"]["title"], "正常改")
+        self.assertEqual(self._raw(project)["schema_version"], v3.V3_SCHEMA_VERSION)
+
+
+class P1FixCorruptRecoveryTest(_Base):
+    """P1-Fix / P1-03：双侧 Story 损坏时的安全恢复。"""
+
+    def _corrupt_primary(self, project):
+        path = project / "stories" / "story" / "story.json"
+        path.write_bytes(b'{"broken": ')     # truncate 覆盖，尾部不会残留
+        return path
+
+    def test_story_file_broken_project_story_valid(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        path = self._corrupt_primary(project)
+        self.pm.open_project(project)                            # GUI 打开流程
+        story = json.loads((project / "stories/story/story.json").read_text("utf-8"))
+        self.assertEqual(len(story["shots"]), 3)                 # 从 project.json 恢复
+        # 打开即可读到故事（V2 视图拿得到 project.json 里的故事）
+        self.assertEqual(len(self.pm.get_story(self.pm.load(project))["shots"]), 3)
+        backups = list((project / ".corrupt").glob("story.json.*.bak"))
+        self.assertEqual(len(backups), 1)                        # 原始损坏字节保留
+        self.assertEqual(backups[0].read_bytes(), b'{"broken": ')
+
+    def test_story_file_missing_project_story_valid(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        (project / "stories/story/story.json").unlink()
+        data = self.pm.migrate(self.pm.load(project))[0]
+        self.pm.save(project, data)
+        story = json.loads((project / "stories/story/story.json").read_text("utf-8"))
+        self.assertEqual(len(story["shots"]), 3)
+
+    def test_both_sides_broken_is_reported_and_bytes_kept(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        broken = self._corrupt_primary(project)
+        for entry in (project / "versions").glob("*.json"):
+            entry.unlink()
+        raw = self._raw(project)
+        raw["story"] = {"schema_version": 2, "title": "坏", "shots": "not-a-list"}
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        vm = v3.V3ProjectManager(project)
+        with self.assertRaises(v3.CorruptDataError):
+            vm.load(dict(raw))
+        # 原始字节一字未丢：损坏文件先备份进 .corrupt/，再以损坏离开原位置
+        self.assertFalse(broken.exists())
+        backups = list((project / ".corrupt").glob("story.json.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b'{"broken": ')
+        # V2 界面仍能打开项目（V3 失败不能挡住 V2）
+        self.assertEqual(self.pm.get_story(self.pm.load(project))["shots"], "not-a-list")
+
+    def test_both_sides_missing_uses_history_if_any(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        (project / "stories/story/story.json").unlink()      # 写一个有效空骨架
+        (project / "stories/story/story.json").write_text(json.dumps(
+            dict(v3.new_story(story_id="story", project_id="V3项目"),
+                 schema_version=2)), encoding="utf-8")
+        raw = self._raw(project)
+        raw["story"] = None
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        self.pm.open_project(project)
+        story = json.loads((project / "stories/story/story.json").read_text("utf-8"))
+        self.assertEqual(len(story["shots"]), 3)                 # 来自 StoryVersion
+        self.assertNotIn("_v3_adopt", story)                     # 内部标记不外泄
+
+    def test_both_sides_invalid_without_history_never_writes_empty_story(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        (project / "stories/story/story.json").unlink()
+        (project / "stories/story/story.json").write_text(json.dumps(
+            dict(v3.new_story(story_id="story", project_id="V3项目"),
+                 schema_version=2)), encoding="utf-8")
+        for entry in (project / "versions").glob("*.json"):
+            entry.unlink()
+        raw = self._raw(project)
+        raw["story"] = None
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        before = (project / "project.json").read_bytes()
+        data = self.pm.migrate(self.pm.load(project))[0]
+        data.pop("_version_snapshot_due", None)
+        self.pm.save(project, data)
+        story = json.loads((project / "stories/story/story.json").read_text("utf-8"))
+        self.assertEqual(story["shots"], [])                     # 不被任何旧内容"恢复"
+        kept = self._raw(project)["story"]
+        self.assertIsNone(kept)                                  # 也不会伪造 story
+        self.assertNotEqual((project / "project.json").read_bytes(), before)
+
+    def test_quarantine_failure_does_not_touch_original(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        path = self._corrupt_primary(project)
+        with mock.patch.object(v3, "shutil") as fake_shutil:
+            fake_shutil.copy2.side_effect = OSError("磁盘满")
+            with self.assertRaises(v3.RepositoryError):
+                v3.V3ProjectManager(project).load(self._raw(project))
+        self.assertEqual(path.read_bytes(), b'{"broken": ')
 
 
 class P1ScopeTest(unittest.TestCase):
