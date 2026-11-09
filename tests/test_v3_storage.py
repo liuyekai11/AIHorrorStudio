@@ -227,16 +227,21 @@ class IntegrityTest(_Base):
         self.assertEqual(len(self._story_file(project)["shots"]), 3)
 
     def test_v3_without_any_story_is_reported(self):
+        # P1-Fix-2（R-A2/R-A3）：空骨架 + 无故事 + 无快照 → 明确的「部分恢复」
+        # 状态（而不是静默当成正常空 Story），原始内容不丢、不自动创建空 Story。
         project = self._project()
         raw = self._raw(project)
         raw["story"] = None
         (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
                                               encoding="utf-8")
-        (project / "stories" / "story" / "story.json").unlink()
-        vm = v3.V3ProjectManager(project)
-        with self.assertRaises(v3.RepositoryError):
-            vm.load(dict(raw))
-        self.assertEqual(self.pm.get_story(self.pm.load(project)), raw["story"])
+        skeleton = project / "stories" / "story" / "story.json"
+        skeleton.unlink()
+        data, changed = v3.V3ProjectManager(project).load(dict(raw))
+        self.assertTrue(changed)
+        self.assertEqual(data["recovery_status"]["state"], "partial")
+        self.assertEqual(data.get("story"), None)          # 不自动创建空 Story
+        self.assertFalse(skeleton.exists())                # 也不写骨架
+        self.assertEqual(self.pm.get_story(self.pm.load(project)), None)
 
     def test_corrupt_story_file_does_not_lose_project(self):
         project = self._project()
@@ -695,6 +700,410 @@ class P1ScopeTest(unittest.TestCase):
         for forbidden in ("requests", "urllib", "tkinter", "story_engine", "main_window"):
             self.assertNotIn(f"import {forbidden}", source)
             self.assertNotIn(f"from {forbidden}", source)
+
+
+class P1Fix2CorruptJudgeTest(_Base):
+    """P1-Fix-2 / R-A2：JSON 合法性、结构可用性、业务有效性分级判定。"""
+
+    def _set_project_story(self, project, value):
+        path = project / "project.json"
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["story"] = value
+        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    def test_valid_json_shots_string_is_quarantined_and_recovered(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        bad = json.dumps({"schema_version": 2, "title": "坏", "shots": "not-a-list"})
+        (project / "stories/story/story.json").write_text(bad, encoding="utf-8")
+        self.pm.open_project(project)
+        backups = list((project / ".corrupt").glob("story.json.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), bad.encode("utf-8"))   # 原始字节保留
+        story = self._story_file(project)
+        self.assertEqual(len(story["shots"]), 3)                          # 由 project.json 恢复
+        self.assertNotIn("_v3_adopt", story)
+
+    def test_valid_json_root_not_object_is_corrupt(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        path = project / "stories/story/story.json"
+        path.write_text('[1, 2, 3]', encoding="utf-8")
+        self.pm.open_project(project)
+        self.assertEqual(len(self._story_file(project)["shots"]), 3)
+        self.assertEqual(list((project / ".corrupt").glob("story.json.*.bak"))[0]
+                         .read_bytes(), b'[1, 2, 3]')
+
+    def test_shots_missing_is_corrupt(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        (project / "stories/story/story.json").write_text(
+            json.dumps({"schema_version": 2, "title": "无镜头"}), encoding="utf-8")
+        self.pm.open_project(project)
+        self.assertEqual(len(self._story_file(project)["shots"]), 3)
+
+    def test_empty_shots_is_legal_not_corrupt(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=0))
+        path = project / "stories/story/story.json"
+        before = path.read_bytes()
+        self.assertFalse(v3.is_valid_story({"shots": []}))          # 业务上「空」
+        self.assertTrue(v3.is_structural_story({"shots": []}))      # 结构上「可用」
+        self.pm.open_project(project)
+        self.assertEqual(path.read_bytes(), before)                 # 一个字节都没动
+        self.assertFalse((project / ".corrupt").exists())
+        self.assertEqual(self._story_file(project)["shots"], [])
+
+    def test_structural_bad_both_sides_but_project_json_recoverable(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        valid_story = self.pm.get_story(self.pm.load(project))
+        valid_story["shots"] = [{"index": 1, "scene": "a", "narration": "b",
+                                 "duration": 1.0}]
+        self.pm.set_story(project, valid_story)          # stories/ 与 project.json 同步
+        (project / "stories/story/story.json").write_text(
+            json.dumps({"shots": "bad"}), encoding="utf-8")
+        self.pm.open_project(project)
+        self.assertEqual(len(self._story_file(project)["shots"]), 1)
+        self.assertEqual(self._story_file(project)["shots"][0]["scene"], "a")
+        self.assertEqual(len(list((project / ".corrupt").glob("story.json.*.bak"))), 1)
+
+    def test_structural_bad_both_sides_recovers_from_history(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        saved = self.pm.save_version(project, self.pm.load(project), note="基线")
+        self.pm.clear_story(project)                     # 两侧都没有可用 Story
+        self.assertIsNone(self._raw(project).get("story"))
+        (project / "stories/story/story.json").write_text(
+            json.dumps({"shots": {"not": "list"}}), encoding="utf-8")
+        self.pm.open_project(project)
+        story = self._story_file(project)
+        self.assertEqual(len(story["shots"]), 3)         # 从 versions/ 快照恢复
+        active = story["active_version"]
+        self.assertTrue(active)                          # 合法活动版本
+        self.assertTrue((project / "versions" / f"{active}.json").exists())
+        listed = [v["version_id"] for v in story["versions"]]
+        self.assertIn(saved["version_id"], listed)      # 用户存的版本都还在
+        self.assertIn(active, listed)
+        self.assertEqual(self.pm.recovery_status["state"], "recovered")
+        for marker in ("_v3_adopt", "_recovery_candidate", "recovery_status",
+                       "_not_recovered"):
+            self.assertNotIn(marker, story)              # 内部标记不落盘
+        self.assertNotIn("recovery_status", self._raw(project))
+
+    def test_structural_bad_no_history_raises_and_keeps_bytes(self):
+        # 双侧结构损坏（project.json 的 shots 不是列表）且无快照：明确报错，
+        # 原始字节全部保留（隔离进 .corrupt/），绝不用空骨架覆盖。
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        bad = json.dumps({"shots": None})
+        for entry in (project / "versions").glob("*.json"):
+            entry.unlink()
+        path = project / "stories/story/story.json"
+        path.write_text(bad, encoding="utf-8")
+        raw = self._raw(project)
+        raw["story"] = {"schema_version": 2, "title": "坏", "shots": "not-a-list"}
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        before = {p: p.read_bytes() for p in project.rglob("*") if p.is_file()}
+        before.pop(path)                                 # 该文件会被原样隔离
+        with self.assertRaises((v3.CorruptDataError, ProjectError)) as ctx:
+            self.pm.open_project(project)
+        # 明确报「无法恢复」的损坏，而不是把失败伪装成「没有故事 / 正常空项目」
+        self.assertIn("结构无效", str(ctx.exception))
+        self.assertIn("未被覆盖", str(ctx.exception))
+        after = {p: p.read_bytes() for p in project.rglob("*") if p.is_file()}
+        for target in before:
+            self.assertEqual(after[target], before[target])   # 其它文件一字未动
+        self.assertFalse(path.exists())                       # 先隔离，原位置不留坏文件
+        backups = list((project / ".corrupt").glob("story.json.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), bad.encode("utf-8"))
+        # project.json 的坏 story 原样保留（未采用、未改写）
+        self.assertEqual(json.loads((project / "project.json").read_text("utf-8"))["story"],
+                         {"schema_version": 2, "title": "坏", "shots": "not-a-list"})
+    def test_quarantine_failure_aborts_without_any_write(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        path = project / "stories/story/story.json"
+        path.write_text(json.dumps({"shots": "bad"}), encoding="utf-8")
+        before = {p: p.read_bytes() for p in project.rglob("*") if p.is_file()}
+        with mock.patch.object(v3.shutil, "copy2", side_effect=OSError("磁盘满")):
+            with self.assertRaises(v3.RepositoryError):
+                v3.V3ProjectManager(project).load(self._raw(project))
+        after = {p: p.read_bytes() for p in project.rglob("*") if p.is_file()}
+        self.assertEqual(after, before)              # 隔离失败 → 不进行任何写入
+
+    def test_open_get_story_save_reopen_preserves_original_bytes(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        bad = b'{"broken": '
+        (project / "stories/story/story.json").write_bytes(bad)
+        self.pm.open_project(project)
+        data = self.pm.load(project)
+        self.assertEqual(len(self.pm.get_story(data)["shots"]), 3)     # V2 视图可用
+        self.pm.save(project, data)                                    # 保存不丢数据
+        backups = list((project / ".corrupt").glob("story.json.*.bak"))
+        self.assertEqual(backups[0].read_bytes(), bad)                 # 原始字节仍在
+        self.pm.open_project(project)                                  # 再开一次稳定
+        self.assertEqual(len(self._story_file(project)["shots"]), 3)
+        self.assertEqual(len(list((project / ".corrupt").glob("story.json.*.bak"))), 1)
+
+    def test_partial_recovery_is_marked_and_not_written_back(self):
+        project = self._project()               # 新建项目：合法的空故事
+        path = project / "stories/story/story.json"
+        path.write_bytes(b'{"broken": ')
+        self.pm.open_project(project)
+        self.assertEqual(self.pm.recovery_status["state"], "partial")
+        self.assertIn("未从 versions/ 覆盖", self.pm.recovery_status["reason"])
+        self.assertEqual(len(list((project / ".corrupt").glob("story.json.*.bak"))), 1)
+        self.assertFalse(path.exists())         # 打开时不会把当前状态写回去覆盖
+        data = self.pm.load(project)
+        self.pm.save(project, data)             # 显式保存同样不重建故事文件
+        self.assertFalse(path.exists())
+        raw = self._raw(project)
+        self.assertNotIn("recovery_status", raw)      # 恢复状态只留在内存
+        self.assertNotIn("_not_recovered", raw)
+        self.assertFalse(raw.get("story"))
+
+
+class P1Fix2VersionRebuildTest(_Base):
+    """P1-Fix-2 / R-C1：从 versions/ 重建版本元信息，不伪造、不删除。"""
+
+    def _seed(self, project, n=3):
+        """存一版故事，再用 save_version 记录一版带 note 的（返回 note 版条目）。"""
+        self.pm.set_story(project, _story(n=n))
+        return self.pm.save_version(project, self.pm.load(project), note="基线")
+
+    def _break_story(self, project):
+        # 两侧都没有可用 Story，只剩 versions/ 快照文件
+        self.pm.clear_story(project)
+        (project / "stories/story/story.json").write_bytes(b'{"broken": ')
+
+    def _versions_root(self, project):
+        return project / "versions"
+
+    def _disk_ids(self, project):
+        return {p.stem for p in self._versions_root(project).glob("v*.json")}
+
+    def test_versions_list_contains_every_verifiable_snapshot(self):
+        project = self._project()
+        saved = self._seed(project)
+        self._break_story(project)
+        disk = self._disk_ids(project)                     # 所有快照都完整可读
+        self.assertIn(saved["version_id"], disk)
+        data, changed = v3.V3ProjectManager(project).load(self._raw(project))
+        self.assertTrue(changed)
+        listed = [v["version_id"] for v in data["story"]["versions"]]
+        self.assertEqual(sorted(listed), sorted(disk))     # 可验证的全部列出，且不漏
+        self.assertEqual(data["recovery_status"]["state"], "recovered")
+
+    def test_listed_entries_are_rebuilt_from_snapshot_content(self):
+        project = self._project()
+        saved = self._seed(project)
+        snapshot = json.loads((self._versions_root(project)
+                               / f"{saved['version_id']}.json").read_text("utf-8"))
+        self._break_story(project)
+        data, _ = v3.V3ProjectManager(project).load(self._raw(project))
+        entry = [v for v in data["story"]["versions"]
+                 if v["version_id"] == saved["version_id"]][0]
+        self.assertEqual(entry["note"], snapshot["note"])
+        self.assertEqual(entry["created_at"], snapshot["created_at"])
+        self.assertEqual(entry["title"], snapshot["title"])
+        self.assertEqual(entry["shot_count"], len(snapshot["shots"]))
+        self.assertEqual(entry["file"], f"versions/{saved['version_id']}.json")
+
+    def test_active_version_points_to_real_readable_version(self):
+        project = self._project()
+        saved = self._seed(project)
+        self._break_story(project)
+        data, _ = v3.V3ProjectManager(project).load(self._raw(project))
+        active = data["story"]["active_version"]
+        self.assertTrue(active)                            # 合法、非空
+        self.assertIn(active, self._disk_ids(project))     # 指向真实存在的快照文件
+        self.assertTrue((self._versions_root(project) / f"{active}.json").exists())
+        listed = {v["version_id"]: v for v in data["story"]["versions"]}
+        self.assertIn(active, listed)
+        self.assertEqual(listed[active]["file"], f"versions/{active}.json")
+        self.assertIn(saved["version_id"], listed)         # 用户显式存的版本也在列表里
+
+    def test_unreadable_snapshot_is_not_fabricated(self):
+        project = self._project()
+        saved = self._seed(project)
+        broken_id = "v20990101-000000-ffff"
+        broken = self._versions_root(project) / f"{broken_id}.json"
+        broken.write_bytes(b'{"broken": ')
+        self._break_story(project)
+        data, _ = v3.V3ProjectManager(project).load(self._raw(project))
+        listed = [v["version_id"] for v in data["story"]["versions"]]
+        self.assertNotIn(broken_id, listed)                 # 不伪造读不出的版本
+        self.assertIn(saved["version_id"], listed)
+        self.assertNotEqual(data["story"]["active_version"], broken_id)
+        self.assertEqual(data["recovery_status"]["state"], "partial")
+        self.assertIn(broken_id, data["recovery_status"]["reason"])
+        self.assertEqual(broken.read_bytes(), b'{"broken": ')  # 原快照文件未动
+
+    def test_structural_bad_snapshot_is_not_listed(self):
+        project = self._project()
+        saved = self._seed(project)
+        bad_id = "v20990101-000000-eeee"
+        bad = self._versions_root(project) / f"{bad_id}.json"
+        bad.write_text(json.dumps({"version_id": bad_id, "shots": "bad"}), encoding="utf-8")
+        self._break_story(project)
+        data, _ = v3.V3ProjectManager(project).load(self._raw(project))
+        listed = [v["version_id"] for v in data["story"]["versions"]]
+        self.assertNotIn(bad_id, listed)                    # 结构坏的快照不算可验证
+        self.assertIn(saved["version_id"], listed)
+        self.assertTrue(bad.exists())                       # 文件保留
+
+    def test_missing_shots_snapshot_is_not_listed(self):
+        project = self._project()
+        saved = self._seed(project)
+        bad_id = "v20990101-000000-dddd"
+        bad = self._versions_root(project) / f"{bad_id}.json"
+        bad.write_text(json.dumps({"version_id": bad_id, "title": "无镜头"}), encoding="utf-8")
+        self._break_story(project)
+        data, _ = v3.V3ProjectManager(project).load(self._raw(project))
+        listed = [v["version_id"] for v in data["story"]["versions"]]
+        self.assertNotIn(bad_id, listed)                    # 无镜头的快照不作为版本
+        self.assertIn(saved["version_id"], listed)
+
+    def test_entries_have_required_fields_and_no_dangling_refs(self):
+        project = self._project()
+        saved = self._seed(project)
+        self._break_story(project)
+        data, _ = v3.V3ProjectManager(project).load(self._raw(project))
+        entries = {v["version_id"]: v for v in data["story"]["versions"]}
+        for entry in entries.values():
+            for key in ("created_at", "note", "official", "title", "shot_count", "file"):
+                self.assertIn(key, entry)
+            if entry.get("base_version"):
+                self.assertIn(entry["base_version"], entries)  # 不留悬空引用
+        self.assertEqual(entries[saved["version_id"]]["note"], "基线")
+
+    def test_restore_after_recovery_keeps_base_reference(self):
+        project = self._project()
+        saved = self._seed(project)
+        self._break_story(project)
+        self.pm.open_project(project)
+        data = self.pm.migrate(self.pm.load(project))[0]
+        entry = self.pm.restore_version(project, saved["version_id"])
+        self.assertEqual(entry.get("base_version"), saved["version_id"])
+        listed = [v for v in self._story_file(project)["versions"]
+                  if v["version_id"] == entry["version_id"]]
+        self.assertTrue(listed)
+        self.assertEqual(listed[0].get("base_version"), saved["version_id"])
+        self.assertNotIn("_v3_adopt", self._story_file(project))
+        del data
+
+    def test_original_snapshot_files_all_kept(self):
+        project = self._project()
+        self._seed(project)
+        before = {p.name: p.read_bytes()
+                  for p in self._versions_root(project).glob("*.json")}
+        self._break_story(project)
+        self.pm.open_project(project)
+        after = {p.name: p.read_bytes()
+                 for p in self._versions_root(project).glob("*.json")}
+        for name, raw in before.items():
+            self.assertEqual(after[name], raw)               # 字节不变
+        self.assertTrue(set(before) <= set(after))
+
+    def test_reopen_keeps_rebuilt_list(self):
+        project = self._project()
+        saved = self._seed(project)
+        self._break_story(project)
+        self.pm.open_project(project)
+        first = [v["version_id"] for v in self._story_file(project)["versions"]]
+        self.assertIn(saved["version_id"], first)
+        self.assertEqual(sorted(first), sorted(self._disk_ids(project)))
+        self.pm.open_project(project)
+        second = [v["version_id"] for v in self._story_file(project)["versions"]]
+        self.assertEqual(first, second)                      # 重开不丢列表、不重复
+        self.assertNotIn("_v3_adopt", self._story_file(project))
+
+    def test_save_version_after_recovery_keeps_old_and_new(self):
+        project = self._project()
+        saved = self._seed(project)
+        self._break_story(project)
+        self.pm.open_project(project)
+        new = self.pm.save_version(project, self.pm.load(project), note="恢复后")["version_id"]
+        listed = [v["version_id"] for v in self._story_file(project)["versions"]]
+        self.assertIn(new, listed)
+        self.assertIn(saved["version_id"], listed)
+        self.assertTrue((self._versions_root(project) / f"{new}.json").exists())
+
+    def test_file_missing_path_strips_internal_markers(self):
+        project = self._project()
+        saved = self._seed(project)
+        (project / "stories/story/story.json").unlink()      # 只有文件缺失
+        self.pm.open_project(project)
+        story = self._story_file(project)
+        for marker in ("_v3_adopt", "_recovery_candidate", "recovery_status"):
+            self.assertNotIn(marker, story)                  # 内部标记不落盘
+        self.assertEqual(len(story["shots"]), 3)
+        listed = [v["version_id"] for v in story["versions"]]
+        self.assertIn(saved["version_id"], listed)           # 同样走元信息重建
+        self.assertEqual(sorted(listed), sorted(self._disk_ids(project)))
+
+
+class P1Fix2TaskBoundaryTest(_Base):
+    """P1-Fix-2 / R-T1：未来版本只读边界不覆盖 .tasks/ 运行过程元数据。"""
+
+    def _future_project(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        self.pm.save_version(project, self.pm.load(project), note="基线")
+        raw = self._raw(project)
+        raw["schema_version"] = v3.V3_SCHEMA_VERSION + 1
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        return project
+
+    def _business(self, project):
+        return {str(p.relative_to(project)): p.read_bytes()
+                for p in project.rglob("*")
+                if p.is_file() and ".tasks" not in p.parts}
+
+    def test_start_and_finish_allowed_on_future_project(self):
+        project = self._future_project()
+        before = self._business(project)
+        tasks = v3.TaskStore(project)
+        task = tasks.start("render", "渲染")
+        self.assertEqual(task["status"], "running")
+        self.assertTrue(any((project / ".tasks").glob("*.json")))
+        done = tasks.finish(task["task_id"], "succeeded")
+        self.assertEqual(done["status"], "succeeded")
+        self.assertEqual(self.pm.load(project)["schema_version"], 4)   # 磁盘仍是未来版本
+        self.assertEqual(self._business(project), before)              # 业务数据零改动
+
+    def test_mark_abandoned_refused_on_future_project(self):
+        project = self._future_project()
+        tasks = v3.TaskStore(project)
+        # 直接写一条 running 记录（绕过 start 之外的路径），再验证守卫
+        (project / ".tasks").mkdir(exist_ok=True)
+        (project / ".tasks" / "t1.json").write_text(json.dumps(
+            {"task_id": "t1", "kind": "render", "status": "running"}), encoding="utf-8")
+        before = (project / ".tasks" / "t1.json").read_bytes()
+        tasks = v3.TaskStore(project)
+        with self.assertRaises(v3.RepositoryError):
+            tasks.mark_abandoned()
+        self.assertEqual((project / ".tasks" / "t1.json").read_bytes(), before)
+
+    def test_future_version_business_write_still_refused(self):
+        project = self._future_project()
+        before = self._business(project)
+        data = self.pm.load(project)
+        with self.assertRaises((ProjectReadOnlyError, v3.RepositoryError)):
+            self.pm.save(project, data)
+        self.assertEqual(self._business(project), before)
+
+    def test_normal_v3_task_behavior_unchanged(self):
+        project = self._project()
+        tasks = v3.TaskStore(project)
+        task = tasks.start("render")
+        self.assertEqual(tasks.mark_abandoned(), 1)
+        self.assertEqual(tasks.get(task["task_id"])["status"], "failed")
 
 
 if __name__ == "__main__":

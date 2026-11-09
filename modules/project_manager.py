@@ -213,6 +213,10 @@ class ProjectManager:
         self._disk_story_version: int = -1      # 最近一次打开项目时磁盘上 story 的结构版本
         self._opening: bool = False             # 正在 open_project（对账写回允许因只读跳过）
         self._snapshot_written: bool = False    # 本次打开已写过升级快照
+        # P1-Fix-2（R-A3）：最近一次打开时 Story 的恢复状态（None = 正常）。
+        # {"state": "recovered" | "partial", "reason": "..."}；供上层识别，
+        # 「恢复失败 / 部分恢复」不再被当成「正常空故事」。
+        self.recovery_status: dict | None = None
 
     def _v3_context(self, project: Path):
         """临时把 V3 上下文指向 project（嵌套调用时恢复原值）。"""
@@ -286,6 +290,7 @@ class ProjectManager:
         outer = self._v3_context(project)
         self._opening = True
         self._snapshot_written = False
+        self.recovery_status = None           # R-A3：每次打开重新判定
         try:
             return self._open_project(project)
         finally:
@@ -350,6 +355,8 @@ class ProjectManager:
             data.pop("_version_snapshot_due", None)
             data.pop("_v3_adopt", None)
             data.pop("_v3_upgraded", None)
+            data.pop("recovery_status", None)      # R-A3：恢复状态只进内存
+            data.pop("_not_recovered", None)
             if "story_schema_version" in data:
                 # 只由本次 load 记录；内存数据又节省一次写盘（保存时会直接比较）
                 data.pop("story_schema_version", None)
@@ -438,6 +445,10 @@ class ProjectManager:
                 raise ProjectReadOnlyError(str(exc)) from None
         try:
             v3_storage.sync_story(project, data)
+            status = data.pop("recovery_status", None)
+            if status is not None:
+                # R-A3：供上层识别「恢复/部分恢复」；状态本身不落盘
+                self.recovery_status = status
             disk = data
             if _is_v3_data(project, data):
                 disk = dict(data)
@@ -459,6 +470,10 @@ class ProjectManager:
         data = copy.deepcopy(data)
         changed = False
         version_changed = False      # story 结构升级 / 镜头版本号变化：需要存版本快照
+        if "recovery_status" in data:
+            # P1-Fix-2（R-A3）：V3 层在 load 阶段记录的恢复状态不是业务数据：
+            # 移交给实例属性供上层读取，绝不写进 project.json
+            self.recovery_status = data.pop("recovery_status")
 
         # V3 P1：未来版本（磁盘上 schema_version 更高）只读——不做迁移、不改任何版本号，
         # 保证打开之后原样写回也不会把磁盘版本号写小
@@ -579,16 +594,22 @@ class ProjectManager:
                           / v3_storage.STORY_FILE)
             broken = False
             try:
-                stored = v3_storage.read_json(story_path)
+                # P1-Fix-2（R-A2）：统一可用性判定——JSON 坏 或 结构不可用
+                # （shots 不是列表 / 根不是对象）都算损坏；空骨架 shots:[] 不算。
+                stored = v3_storage.V3ProjectManager(project).usable_story_file(story_path)
                 if isinstance(stored, dict) and stored.get("schema_version") != STORY_SCHEMA_VERSION:
                     # 结构版本不符 = 无法确认内容可用，按损坏隔离
-                    raise v3_storage.CorruptDataError("stories/ 结构版本不符")
+                    broken = True
             except v3_storage.CorruptDataError:
                 broken = True
             except v3_storage.RepositoryError:
                 pass
             if broken:
-                v3_storage.V3ProjectManager(project)._quarantine_corrupt(story_path)
+                vm = v3_storage.V3ProjectManager(project)
+                if vm._quarantine_corrupt(story_path) is None:
+                    raise ProjectError(
+                        f"{story_path} 内容损坏，且备份到 .corrupt/ 失败："
+                        "为避免覆盖唯一数据，本次保存已中止（未写入任何文件）。")
                 data.pop("_v3_adopt", None)     # 文件已隔离：交给 V3 层按规则恢复
             if not data.get("_v3_adopt"):
                 # _v3_adopt：内存里的 story 刚由 migrate 升级 / 由 project.json 采纳，
@@ -609,7 +630,12 @@ class ProjectManager:
             data.clear()
             data.update(result)
             return True
-        except (v3_storage.RepositoryError, OSError):
+        except (v3_storage.RepositoryError, OSError) as exc:
+            if isinstance(exc, v3_storage.CorruptDataError):
+                # P1-Fix-2（R-A2/R-A3）：V3 层已判定数据损坏且无法恢复（原始字节
+                # 已隔离到 .corrupt/）。不能把它当成「没有故事」静默打开——否则
+                # 上层看到的是正常空项目，恢复失败被伪装成正常空 Story。
+                raise ProjectError(str(exc)) from None
             return False
 
     def _make_shot(self, image: str | None, duration: float = DEFAULT_DURATION) -> dict:
@@ -772,8 +798,10 @@ class ProjectManager:
             return True
         shots = story.get("shots")
         if not isinstance(shots, list):
-            data.pop("story", None)
-            return True
+            # P1-Fix-2（R-A2）：project.json 里的 story 结构损坏（shots 不是列表）。
+            # 不能在这里把它删掉——V3 层/人工恢复需要看到原始内容才能判定「双侧
+            # 损坏」；删掉会被误判成「没有故事」，进而走空骨架或部分恢复。
+            return False
         from modules import story_schema as ss
         try:
             upgraded, changed = ss.upgrade_story(story)

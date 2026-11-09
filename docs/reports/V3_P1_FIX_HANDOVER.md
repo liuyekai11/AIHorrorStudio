@@ -113,13 +113,14 @@ def assert_writable(project, what: str = "项目数据"):
 | --- | --- |
 | `StoryRepository.create / update / archive / rebuild_index / _sync_index` | 函数首行 |
 | `VersionStore.snapshot / restore` | 函数首行 |
-| `TaskStore.start / finish / mark_abandoned` | 函数首行 |
+| `TaskStore.start / finish` | **不守卫**（P1-Fix-2 / R-T1 最终决定：运行过程元数据不纳入未来版本只读边界） |
+| `TaskStore.mark_abandoned` | 函数首行（启动时的项目级写操作，保留守卫） |
 | `ProjectManager.save` | `sync_story` 之前（`RepositoryError` → `ProjectReadOnlyError`；打开时只读则跳过对账写回） |
 | `ProjectManager.save_version` | 生成版本 id **之前**、创建快照文件**之前** |
 | `ProjectManager.restore_version` | 读取 / 修改 Story 之前 |
 | `ProjectManager.set_story / clear_story / _write_v3_story` | 函数首行 |
 
-**TaskStore 边界决策（代码 + 文档一致）**：`.tasks/` 是运行任务的过程元数据（任务开始 / 结束），不纳入未来版本只读边界；只有 `mark_abandoned()` 属于启动时的**项目级**写操作，纳入保护。理由：未来版本程序的 `project.json` 结构未知，但其 `stories/`、`versions/`、`story/index.json` 与任务运行无关；把运行状态也冻结会让新程序打开过的项目在本程序里彻底不可用，超出 P1「保护业务数据」的既定范围。`TaskStore` 类 docstring 已写明该边界。
+**TaskStore 边界（P1-Fix-2 / R-T1 最终决定）**：`start` 与 `finish` **不**调用 `assert_writable`，`mark_abandoned` **保留**守卫。理由：未来版本程序的 `project.json` 结构未知，但其 `stories/`、`versions/`、`story/index.json` 与任务运行无关；把运行状态也冻结会让新程序打开过的项目在本程序里彻底不可用，超出 P1「保护业务数据」的既定范围。`mark_abandoned` 是启动时按项目进行的写操作，仍纳入边界。类 docstring 与代码一致。此前版本（P1-Fix 首次提交 d4db886）中 `start/finish/mark_abandoned` 三者均守卫的实现已被 R-T1 推翻并修改，见 `docs/reports/V3_P1_FIX2_HANDOVER.md`。
 
 ### P1-02 · `modules/project_manager.py::_write_v3_story`
 
@@ -199,14 +200,14 @@ _hydrate v3 分支                            # 删除「init_primary_story 重�
 
 1. `test_story_file_broken_project_story_valid` — 走 `open_project`：从 project.json 恢复 3 个镜头，`.corrupt/` 恰有 1 份备份，字节 `b'{"broken": '` 完整。
 2. `test_story_file_missing_project_story_valid` — stories 缺失、project.json 有效 → 恢复。
-3. `test_both_sides_broken_is_reported_and_bytes_kept` — 两侧无效、无历史 → `CorruptDataError`；损坏字节进 `.corrupt/` 一字不差；V2 层仍能打开（原样照见 project.json 的 story）。
+3. `test_both_sides_broken_is_reported_and_bytes_kept` — 两侧无效、无历史 → `CorruptDataError`；损坏字节进 `.corrupt/` 一字不差；随后 `pm.load` 不抛错，但 `pm.get_story` 返回 `None`（见最终核验报告第 4/5 节）。
 4. `test_both_sides_missing_uses_history_if_any` — 两侧无有效 story，`versions/` 有快照 → 走 `open_project` 恢复 3 个镜头；`_v3_adopt` 不落盘。
 5. `test_both_sides_invalid_without_history_never_writes_empty_story` — 无历史 → 不写任何旧内容、不伪造 story（project.json 的 `story` 保持 `None`）。
 6. `test_quarantine_failure_does_not_touch_original` — 备份失败（mock `shutil.copy2` 抛 `OSError`）→ 抛错且原文件字节不变。
 
 ### 既有测试的改动说明（诚实披露）
 
-- `IntegrityTest.test_v3_without_any_story_is_reported`：原断言（`vm.load` 抛 `RepositoryError`、`get_story(...)` 为 `None`）**全部保留**；仅新增「原字节进 `.corrupt/`」断言。该测试的回退断言用 `mock.patch.object(v3, "V3ProjectManager")` 模拟 V3 层异常——这是既有测试原本要验证的「V3 失败不阻断 V2」场景。
+- `IntegrityTest.test_v3_without_any_story_is_reported`：原断言（`vm.load` 抛 `RepositoryError`、`get_story(...)` 为 `None`）**全部保留**；仅新增「原字节进 `.corrupt/`」断言。无 mock。
 - 无任何原测试被删除或弱化。
 
 ## 10. 完整测试结果
@@ -233,7 +234,7 @@ _hydrate v3 分支                            # 删除「init_primary_story 重�
 | R-03 | `_version_file` 对非法 `version_id` 可能抛错 | P3 | 现有 `_validate_id` 路径保持一致，未改动 |
 | R-04 | `Attribution` 为类变量（模块级上下文），非线程安全 | P2（审查已有） | 本轮未改 |
 | R-05 | 非正式版本永不自动删除 | 行为变化 | 符合 P1-01 要求；长期可能积累结构升级 / 恢复备份快照，建议后续单独设计清理策略 |
-| R-06 | `TaskStore.start/finish` 不纳入只读边界 | 决策 | 见第 6 节；若 GPT 认为应扩大边界，改动点只有两处 `assert_writable` |
+| R-06 | `TaskStore.start/finish` 实际**纳入**了只读边界（与报告文字「不纳入」矛盾） | **已关闭（P1-Fix-2 / R-T1）** | GPT 决定：`start` / `finish` 不守卫，`mark_abandoned` 保留守卫；代码、docstring、本报告已按最终决定更新。见 `docs/reports/V3_P1_FIX2_HANDOVER.md` |
 | R-07 | P2-01..P2-09、P3-01..P3-05（原审查） | 未处理 | 不在 P1-Fix 范围 |
 
 ## 13. 安全检查（确认）
@@ -261,7 +262,7 @@ _hydrate v3 分支                            # 删除「init_primary_story 重�
 
 1. `_prune_versions`：非正式版本「永不删除」的新语义是否符合 V2.2 预期；`official_only` 参数保留但语义收窄。
 2. `assert_writable` 在 `project.json` 缺失 / 损坏时放行——是否覆盖全部未来版本场景（已测：save / save_version / restore_version / set+clear / StoryRepository ×3 / VersionStore ×2 / init_primary_story）。
-3. TaskStore 边界：`.tasks/` 不纳入、`mark_abandoned` 纳入——确认可接受。
+3. TaskStore 边界：`.tasks/` 不纳入、`mark_abandoned` 纳入——**已按 GPT 决定落地（P1-Fix-2 / R-T1）**：`start / finish` 不守卫，`mark_abandoned` 保留守卫；代码与 docstring 一致。详见 `docs/reports/V3_P1_FIX2_HANDOVER.md` 第 8 节。
 4. 隔离语义：损坏文件从原位移入 `.corrupt/`（字节 copy2 保留）。是否接受「原位置不存在、备份存在」作为「保留原始字节」的合规实现。
 5. 规则 ⑥（`project.json.story` 有镜头但 `shots` 非列表 → 不作空项目处理）。
 6. `_normalize_story` 在 `_v3_adopt` 存在时跳过是否可能漏掉其它规范化（candidate 来自 version 快照，已含 `schema_version` / `shots`）。
