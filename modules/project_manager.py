@@ -217,9 +217,21 @@ class ProjectManager:
         # {"state": "recovered" | "partial", "reason": "..."}；供上层识别，
         # 「恢复失败 / 部分恢复」不再被当成「正常空故事」。
         self.recovery_status: dict | None = None
+        # P1-Fix-3：待隔离的损坏 stories/ 主 Story 文件（项目, 路径）。
+        # _v3_load 只做**只读判定**并留下标记，真正的物理隔离（.corrupt/ 备份 +
+        # 移出原位置）推迟到确认有恢复源、且即将写盘之前（_guard_pending_quarantine）。
+        # 只存在于内存，绝不进 data / project.json。
+        self._pending_quarantine: tuple[Path, Path] | None = None
+        self._pending_authoritative: bool = False  # 标记来自一次打开/保存流程（V3 已看过 project.json）
+        self._quarantine_source: str | None = None        # 最近一次隔离所依据的恢复源
 
     def _v3_context(self, project: Path):
-        """临时把 V3 上下文指向 project（嵌套调用时恢复原值）。"""
+        """临时把 V3 上下文指向 project（嵌套调用时恢复原值）。
+
+        P1-Fix-3：待隔离标记随「最外层上下文」存活——只在 _v3_restore 的最外层
+        清除（嵌套的 load / save 结束时不清）；标记带项目路径，闸门只对产生它的
+        项目生效，另一个项目绝不会因此被隔离。
+        """
         from modules import v3_storage
         outer = v3_storage.Attribution.project
         self._v3_project = Path(project)
@@ -232,6 +244,81 @@ class ProjectManager:
         self._v3_project = None
         if outer is None:
             v3_storage.Attribution.restore()
+            self._release_pending_quarantine()
+
+    # ------------------------------------------------------------------
+    # P1-Fix-3：损坏文件的「先确认恢复源、后隔离、再写盘」
+    # ------------------------------------------------------------------
+    def _guard_pending_quarantine(self, project: Path, data: dict | None = None):
+        """写盘前的闸门：没有恢复源 → 整次拒绝；存在**已确认的恢复源**时先隔离。
+
+        只读标记本身不算恢复源：标记由 _v3_load 的只读判定产生（此时可能还没有任何
+        恢复结论）。只有以下情况才有权隔离，否则本次写入整次拒绝（零写入）：
+        - data["_not_recovered"]：部分恢复（无恢复源）→ 直接拒绝；
+        - 本次写盘的 data["_v3_adopt"] 指向的故事结构可用（project.json 采纳 /
+          版本快照恢复 / migrate 结构升级——即将写进 stories/）；或
+        - 磁盘上的 project.json.story 可用（本次内存 data 未携带 story 的情况）。
+        - 文件已不存在（已被恢复 / 已移走）：直接清标记，不重复隔离；
+        - 隔离失败抛 OSError；只产生 .corrupt/ 内的文件，不触碰任何业务文件。
+        """
+        from modules import v3_storage
+        data = data if isinstance(data, dict) else {}
+        if data.get("_not_recovered"):
+            # 规则 1（P1-Fix-3）：stories/ 损坏且本次没有恢复源（部分恢复）。
+            # 与标记是否仍在无关：只要本次写盘仍处于「未恢复」状态，就整次拒绝，
+            # 绝不把 project.json 的现状写回（那会丢掉版本引用 / 覆盖用户可见的空故事）。
+            raise v3_storage.CorruptDataError(
+                "stories/ 主 Story 损坏且没有可用恢复源（project.json 无可用 story、"
+                "versions/ 无可用快照）：本次未写入任何文件，原文件保持原位。")
+        pending = self._pending_quarantine
+        if pending is None or pending[0] != Path(project):
+            return
+        path = pending[1]
+        if not path.exists():
+            return
+        current = data.get("schema_version")
+        adopt = data.get("_v3_adopt")
+        authoritative = (self._pending_authoritative
+                         and isinstance(current, int)
+                         and current <= v3_storage.V3_SCHEMA_VERSION)
+        if v3_storage.is_structural_story(adopt):
+            source = "内存中已采纳的故事"
+        elif authoritative:
+            # 本次流程（打开 / 保存）已由 V3 层看过磁盘上的 project.json：
+            # 走到这里而没有 _v3_adopt，说明当前没有可采纳的故事——
+            # 与规则 1「无恢复源」等价。
+            source = None
+        else:
+            try:
+                disk = v3_storage.read_json(Path(project) / PROJECT_FILE, {}) or {}
+            except v3_storage.RepositoryError:
+                disk = {}
+            if isinstance(disk, dict) \
+                    and v3_storage.V3ProjectManager._usable_project_story(disk) is not None:
+                source = "project.json 中的 story"
+            else:
+                source = None
+        if source is None:
+            raise v3_storage.CorruptDataError(          # 规则 1：零写入，原位保留
+                f"{path} 内容损坏，且当前没有可用的恢复源（project.json 无可用 story、"
+                "versions/ 中也没有可用快照）。为避免覆盖唯一数据，本次写入已中止，"
+                "未写入任何文件。")
+        backup = v3_storage.V3ProjectManager(Path(project))._quarantine_corrupt(path)
+        if backup is None:
+            # 规则 3：隔离失败立即中止——调用方（打开 / 保存 / 存版本）都按错误处理，
+            # 后续不会有任何业务写入（闸门在任何 tmp / stories/ / project.json 写入之前）。
+            raise ProjectError(
+                f"{path} 内容损坏，且备份到 .corrupt/ 失败："
+                "为避免覆盖唯一数据，本次写入已中止（未写入任何文件）。")
+        self._quarantine_source = source
+        # 标记已消费：同一实例随后为另一个项目写盘时绝不能再隔离
+        self._pending_quarantine = None
+        self._pending_authoritative = False
+
+    def _release_pending_quarantine(self):
+        self._pending_quarantine = None
+        self._pending_authoritative = False
+        self._quarantine_source = None
 
     def create_project(self, parent: Path, name: str) -> Path:
         safe_name = sanitize_name(name)
@@ -412,9 +499,15 @@ class ProjectManager:
         data["story"] = v3_storage.V3ProjectManager.render_story_field(story)
 
     def save(self, project: Path, data: dict):
+        from modules import v3_storage
         outer = self._v3_context(project)
         try:
             self._save(project, data)
+        except v3_storage.CorruptDataError:
+            # P1-Fix-3：规则 1——stories/ 损坏且无恢复源：本次写回整次拒绝，
+            # 项目文件保持原样（不迁移、不对账、不写盘）。GUI 仍可打开；显式保存
+            # 时由调用方看到错误。
+            return
         except ProjectReadOnlyError:
             # 打开项目时的自动对账写回：项目是未来版本时只读打开，不能因此打不开
             if not self._opening:
@@ -444,6 +537,11 @@ class ProjectManager:
                     return           # 打开时的自动对账写回：只读直接跳过
                 raise ProjectReadOnlyError(str(exc)) from None
         try:
+            # P1-Fix-3：写盘闸门——有损坏的 stories/ 文件待隔离时，只有确认了恢复源
+            # （内存 _v3_adopt / project.json 可用 story）才先隔离（原始字节进 .corrupt/）。
+            # 隔离失败或没有恢复源 → 抛错，本次零写入（在任何 tmp / stories/ /
+            # project.json 写入之前）。
+            self._guard_pending_quarantine(project, data)
             v3_storage.sync_story(project, data)
             status = data.pop("recovery_status", None)
             if status is not None:
@@ -453,10 +551,21 @@ class ProjectManager:
             if _is_v3_data(project, data):
                 disk = dict(data)
                 disk["schema_version"] = v3_storage.V3_SCHEMA_VERSION
+        except v3_storage.CorruptDataError:
+            # P1-Fix-3 规则 1：损坏且无恢复源 → 整次拒绝写入（不写 project.json），
+            # 明确告知调用方（打开时的自动对账写回同样不吞：项目保持原样）
+            status = data.pop("recovery_status", None)
+            if status is not None:
+                self.recovery_status = status     # R-A3：部分恢复状态仍要交给上层
+            raise
         except v3_storage.RepositoryError as exc:
             if self._opening:
                 return
             raise ProjectReadOnlyError(str(exc)) from None
+        finally:
+            # 无论写盘是否成功，标记都已消费/失效：文件被隔离或隔离失败中止，
+            # 都不允许残留到下一次写盘（避免陈旧路径误伤）
+            self._release_pending_quarantine()
         tmp = project / (PROJECT_FILE + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(disk, f, ensure_ascii=False, indent=2)
@@ -535,6 +644,9 @@ class ProjectManager:
         if story_upgrade and self._v3_project is not None:
             # V3 项目里升级后的故事要写回 stories/（否则下次 load 会被旧结构覆盖）
             data["_v3_adopt"] = data.get("story")
+        # P1-Fix-3：内存数据可能带着上一次 migrate 的「无恢复源」标记；剥掉后
+        # 只让**本次** _v3_load 重新判定（写盘闸门据本次结论整次拒绝写入）。
+        had_not_recovered = bool(data.pop("_not_recovered", False))
         data.pop("story_schema_version", None)
         # 注意：migrate() 每次读写都会调用，所以版本快照不能在这里生成
         # （否则每次保存都多一个版本）。升级后由 open_project 存一次快照。
@@ -545,6 +657,9 @@ class ProjectManager:
         # V3 P1：project.json 的版本号由基础层决定（新项目 = V3，V2 项目保持不变）。
         if self._v3_load(data):
             changed = True
+        if not_recovered := data.get("_not_recovered"):
+            # 本次 V3 load 判定「损坏且无恢复源」：保留结论，写盘闸门整次拒绝
+            changed = changed or had_not_recovered
         if data.pop("_v3_upgraded", False):
             # V3 对账时发现磁盘上是旧结构 story、由 stories/ 覆盖：同样需要升级快照
             data["_version_snapshot_due"] = True
@@ -586,9 +701,11 @@ class ProjectManager:
             # 写盘路径上，project.json 的 story 字段与 stories/ 对齐（stories/ 缺失时保持原值）。
             # _v3_adopt：本次内存里的 story 刚由 migrate 升级 / 由 project.json 采纳，是权威值，
             # 不能被 stories/ 里的旧内容覆盖（写盘时由 sync_story 写进 stories/）。
-            # P1-Fix（P1-03）：写盘前把损坏的 stories/ 文件隔离（原始字节进 .corrupt/）。
-            # 无论内存里的 story 是否已有权威值（_v3_adopt）都要做：否则随后的
-            # sync_story 会用内存数据直接覆盖唯一证据。
+            # P1-Fix-3：这里只做**只读判定**——发现 stories/ 文件损坏时留下待隔离标记
+            # （self._pending_quarantine），不在打开/判定阶段做任何物理操作（不 copy、
+            # 不删原文件、不建 .corrupt/）。真正的隔离推迟到写盘闸门
+            # _guard_pending_quarantine：确认存在恢复源且即将写盘时才执行，
+            # 保证「双侧损坏、无恢复源」的失败打开对项目字节零影响。
             pid = str(data.get("primary_story_id") or "")
             story_path = (Path(project) / v3_storage.STORIES_DIR / pid
                           / v3_storage.STORY_FILE)
@@ -598,19 +715,22 @@ class ProjectManager:
                 # （shots 不是列表 / 根不是对象）都算损坏；空骨架 shots:[] 不算。
                 stored = v3_storage.V3ProjectManager(project).usable_story_file(story_path)
                 if isinstance(stored, dict) and stored.get("schema_version") != STORY_SCHEMA_VERSION:
-                    # 结构版本不符 = 无法确认内容可用，按损坏隔离
+                    # 结构版本不符 = 无法确认内容可用，按损坏处理
                     broken = True
             except v3_storage.CorruptDataError:
                 broken = True
             except v3_storage.RepositoryError:
                 pass
-            if broken:
-                vm = v3_storage.V3ProjectManager(project)
-                if vm._quarantine_corrupt(story_path) is None:
-                    raise ProjectError(
-                        f"{story_path} 内容损坏，且备份到 .corrupt/ 失败："
-                        "为避免覆盖唯一数据，本次保存已中止（未写入任何文件）。")
-                data.pop("_v3_adopt", None)     # 文件已隔离：交给 V3 层按规则恢复
+            if broken and (self._pending_quarantine is None
+                          or self._pending_quarantine[0] != Path(project)):
+                # 同一项目只记一次：恢复写入之后文件已变好，下次 save 不会再判坏，
+                # 不会重复隔离。恢复源由写盘闸门按**本次** data 判定（见
+                # _guard_pending_quarantine），标记只记路径。
+                self._pending_quarantine = (Path(project), story_path)
+                # 占用中（正在打开 / 保存）：建立「保存一定会经过闸门」的保证。
+                # V2 代码的典型写法 data = migrate(data) 会丢掉迁移期间加入的标记，
+                # 没有它就无法区分「没有故事」和「损坏但无恢复源」。
+                self._pending_authoritative = True
             if not data.get("_v3_adopt"):
                 # _v3_adopt：内存里的 story 刚由 migrate 升级 / 由 project.json 采纳，
                 # 是权威值，不能被 stories/ 里的旧内容覆盖（写盘时由 sync_story 写回）。
@@ -974,21 +1094,30 @@ class ProjectManager:
         versions = story.get("versions")
         if not isinstance(versions, list):
             versions = story["versions"] = []
-        version_id = f"v{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
         root = self._versions_root(project)
         root.mkdir(parents=True, exist_ok=True)
-        snapshot = copy.deepcopy(story)
-        for key in _V3_OWN_KEYS:      # V3 自有字段只属于 stories/，不进快照
-            snapshot.pop(key, None)
-        snapshot.pop("versions", None)
-        snapshot.pop("active_version", None)
-        snapshot["version_id"] = version_id
-        snapshot["created_at"] = datetime.now().isoformat(timespec="seconds")
-        snapshot["note"] = note or ""
-        target = self._version_file(project, version_id)
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(target)
+        try:
+            # P1-Fix-3：写盘闸门——在生成版本文件之前先隔离待隔离的损坏 stories/
+            # 文件（隔离失败 → 零业务写入）。调用方已从 stories/ / project.json 恢复出
+            # 内存 story（即恢复源已确认），本次写盘包含恢复结果。
+            self._guard_pending_quarantine(project, data)
+            version_id = f"v{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
+            snapshot = copy.deepcopy(story)
+            for key in _V3_OWN_KEYS:      # V3 自有字段只属于 stories/，不进快照
+                snapshot.pop(key, None)
+            snapshot.pop("versions", None)
+            snapshot.pop("active_version", None)
+            snapshot["version_id"] = version_id
+            snapshot["created_at"] = datetime.now().isoformat(timespec="seconds")
+            snapshot["note"] = note or ""
+            target = self._version_file(project, version_id)
+            tmp = target.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            tmp.replace(target)
+        finally:
+            # 标记已被闸门消费（隔离完成）或隔离失败中止：都不允许残留
+            self._release_pending_quarantine()
         entry = {
             "version_id": version_id,
             "created_at": snapshot["created_at"],

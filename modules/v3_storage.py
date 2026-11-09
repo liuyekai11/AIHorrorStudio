@@ -833,11 +833,12 @@ class V3ProjectManager(Repository):
         data["recovery_status"] = {"state": state, "reason": reason}
 
     def _not_recovered(self, data: dict, reason: str):
-        """隔离已完成：尽管 project.json 的 story 看起来不能用，也不许用 versions/ 覆盖。
+        """部分恢复：project.json 没有「可用」故事、也没有可用快照。
 
-        stories/ 文件被隔离 = 用户仍有可见的 project.json 故事/空骨架，拿旧快照替换
-        属于「静默换内容」。此时保持内存现状、不写 stories/（sync_story 遇到
-        _not_recovered 直接跳过），并把原因写给上层。
+        P1-Fix-3：**不隔离任何文件**——损坏的 stories/ 文件保持原位。此时保持内存
+        现状、不写 stories/（sync_story 遇到 _not_recovered 直接跳过），并把原因
+        写给上层。用户随后手工恢复 / 修复 project.json 后重开即回到正常流程；
+        在那之前每次保存都会在写盘闸门再次尝试隔离（存在恢复源时）。
         """
         data["_v3_adopt"] = None
         data["_not_recovered"] = True
@@ -960,9 +961,9 @@ class V3ProjectManager(Repository):
         data["story"] = payload
         data["_v3_adopt"] = payload
         state = "recovered" if not report["unverified"] and report["verified"] else "partial"
-        reason = (f"stories/ 主 Story 损坏，已隔离到 .corrupt/；从版本快照 "
-                  f"{candidate_id or '?'} 恢复 Story 内容，并按 versions/ 目录重建 "
-                  f"{report['verified']} 条版本元信息")
+        reason = (f"stories/ 主 Story 损坏，从版本快照 "
+                  f"{candidate_id or '?'} 恢复 Story 内容（写盘前先隔离原文件），并按 "
+                  f"versions/ 目录重建 {report['verified']} 条版本元信息")
         if report["unverified"]:
             reason += (f"；另有 {len(report['unverified'])} 个版本文件不可识别，"
                        "未重建其元信息（原文件保留）：" + "、".join(report["unverified"]))
@@ -974,51 +975,68 @@ class V3ProjectManager(Repository):
         return self.project / VERSIONS_DIR / f"{_validate_id(version_id, 'version_id')}.json"
 
     def _quarantine_corrupt(self, path: Path) -> Path | None:
-        """把损坏文件的原始字节搬到 .corrupt/（不删除、不覆盖）。返回备份路径。"""
+        """把损坏文件的原始字节搬到 .corrupt/（不删除、不覆盖）。返回备份路径。
+
+        P1-Fix-3：失败时保证**零残留**（不留半截 .bak、不创建空 .corrupt/）：
+        先在目标目录写一个随机临时名，copy2 成功后才 rename 成正式备份名，
+        最后才 unlink 原文件。任一环节失败 → 清理临时文件并返回 None，原文件不动。
+        """
         path = Path(path)
+        root = self.project / ".corrupt"
+        created_dir = not root.exists()
+        staging = None
         try:
             if not path.exists():
                 return None
-            root = self.project / ".corrupt"
             root.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             target = root / f"{path.name}.{stamp}.bak"
-            shutil.copy2(path, target)
+            staging = root / f".{path.name}.{uuid.uuid4().hex[:8]}{_TMP_SUFFIX}"
+            shutil.copy2(path, staging)
+            staging.replace(target)
+            staging = None
             path.unlink()
             return target
         except OSError:
+            if staging is not None:
+                try:
+                    staging.unlink()
+                except OSError:
+                    pass
+            if created_dir:
+                try:
+                    root.rmdir()          # 本次创建的 .corrupt/ 失败后不留下
+                except OSError:
+                    pass
             return None
 
     def _recover_corrupt_story(self, data: dict) -> tuple[dict, bool]:
-        """P1-03 规则 2/3：stories/ 损坏（JSON 坏 **或** 结构不可用）时的安全恢复。
+        """stories/ 损坏（JSON 坏 **或** 结构不可用）时的只读恢复判定。
 
         判定统一走 usable_story_file / _usable_project_story（R-A2），处理顺序：
-        - project.json 的 story 可用（有效且结构可读）→ 隔离（保原始字节）后采纳；
-        - 两侧都不可用但有可用快照 → 先隔离损坏文件，再采纳快照（历史版本恢复）；
-          project.json 有内容但结构坏时只记录「未采用」，原字节随文件保留；
-        - project.json 有内容但结构坏且无可用快照 → 直接人工恢复，绝不当空项目；
-        - project.json 结构可读但无镜头（None / 空骨架）且无快照 → 隔离后进入
-          部分恢复状态（recovery_status 留痕，不用旧快照覆盖用户可见的空内容）；
-        - 全部无效且无快照 → 抛 CorruptDataError（保留全部原始字节）。
+        - project.json 的 story 可用（有效且结构可读）→ 采纳（内存）；
+        - 两侧都不可用但有可用快照 → 采纳快照（历史版本恢复）；
+        - project.json 有内容但结构坏且无可用快照 → 抛 CorruptDataError（人工恢复）；
+        - project.json 结构可读但无镜头（None / 空骨架）且无快照 → 部分恢复状态留痕；
+        - 全部无效且无快照 → 抛 CorruptDataError。
         「不可用但非空」任何时候都不会被空骨架或自动创建的空 Story 覆盖。
+
+        **P1-Fix-3：本函数不执行任何物理隔离**。只判定是否存在恢复源并写好内存
+        story；损坏文件的隔离（.corrupt/ 备份 + 移出原位置）由调用方在确认恢复源、
+        即将写盘之前完成（ProjectManager._guard_pending_quarantine）。因此：
+        - 无恢复源而抛错时，项目目录字节零变化；
+        - 有恢复源时先隔离、隔离成功后才写盘。
         """
         current = self._usable_project_story(data)   # 有效且结构可读才算可用
         pid = str(data.get("primary_story_id") or PRIMARY_STORY_ID)
-        story_path = self.stories.story_file(pid)
-        broken = story_path.exists()
 
-        def quarantine() -> None:
-            if broken and self._quarantine_corrupt(story_path) is None:
-                # 备份失败就不能动原文件（否则丢唯一证据），明确报错交人工处理
-                raise RepositoryError(
-                    f"stories/{pid}/story.json 损坏，且备份损坏文件失败。"
-                    "为避免丢失原始数据，未做任何修改，请手工处理。")
+        # 隔离不在这里做：调用方（ProjectManager 写盘闸门）负责。
+        # 本函数返回的 data 中 _v3_adopt 是权威值，写盘时由 sync_story 写回 stories/。
 
         if current is not None:
-            quarantine()
             data["_v3_adopt"] = current
             self._set_recovery_status(data, "recovered",
-                "stories/ 主 Story 损坏，已隔离到 .corrupt/，并从 project.json 恢复")
+                "stories/ 主 Story 损坏，将从 project.json 恢复（写盘前先隔离原文件）")
             return data, True
         raw_story = data.get("story")
         project_bad = (isinstance(raw_story, dict) and raw_story.get("shots")
@@ -1026,8 +1044,7 @@ class V3ProjectManager(Repository):
         candidate = self._recoverable_version(data)
         if candidate is not None:
             # 可用快照优先于「双侧都坏」判定（R-A2：双侧损坏 → 历史版本恢复）；
-            # 损坏的 stories/ 文件先原样隔离，快照只写进内存，由后续保存落盘。
-            quarantine()
+            # 快照只写进内存，由后续保存落盘
             self._restore_from_snapshot(data, candidate)
             self._assign_primary(data)
             if project_bad:
@@ -1038,18 +1055,18 @@ class V3ProjectManager(Repository):
         if project_bad:
             # 有内容但结构坏（如 shots 不是列表），也没有可用快照：
             # 已损坏、不可用，也绝不是空项目。走人工恢复，不用空骨架覆盖。
-            quarantine()
+            # P1-Fix-3：不隔离、不删除、不移动——本次打开对项目字节零影响。
             raise CorruptDataError(
                 f"stories/{pid}/story.json 损坏/缺失，project.json 中的 story 结构无效、"
-                "无法恢复，versions/ 中也没有可用快照。损坏文件已按原字节备份到 "
-                ".corrupt/，未被覆盖。请手工检查后从备份恢复。")
+                "无法恢复，versions/ 中也没有可用快照。未对任何文件做修改（原始数据"
+                "保持原位），请手工检查后恢复。")
         # project.json 中没有故事（None）或结构合法的空故事（shots: []）：
-        # 隔离损坏文件，保持现状，不用骨架覆盖用户可见的内容；进入部分恢复状态留痕。
+        # 保持现状，不用骨架覆盖用户可见的内容；进入部分恢复状态留痕。
         # R-A2：shots 为空是合法 Story，明确标记为「部分恢复」而不是伪装成正常空 Story。
-        quarantine()
         return self._not_recovered(data,
-            "stories/ 主 Story 损坏，已隔离到 .corrupt/；project.json 中没有"
-            "可用故事，未从 versions/ 覆盖当前内容（部分恢复，无可用快照）")
+            "stories/ 主 Story 损坏，project.json 中没有可用故事，"
+            "未从 versions/ 覆盖当前内容（部分恢复，无可用快照）；"
+            "未隔离、未删除原文件，保存时若仍无恢复源将整次拒绝写入")
 
     def _hydrate(self, data: dict, story: dict, *, version: int) -> tuple[dict, bool]:
         changed = False
@@ -1269,9 +1286,10 @@ def sync_story(project: Path, data: dict) -> bool:
     adopt = bool(data.pop("_v3_adopt", None))   # 写盘前清理内部标记
     data.pop("_v3_upgraded", None)
     if data.pop("_not_recovered", False):
-        # P1-Fix-2（R-A2/R-A3）：stories/ 文件损坏且已隔离、project.json 没有可用
+        # P1-Fix-2（R-A2/R-A3）：stories/ 文件损坏、project.json 没有可用
         # 故事 —— 本次保存不得把 project.json 的现状写回 stories/（那会悄悄丢掉
         # 版本引用或覆盖用户的空故事），交给下次打开按损坏规则再处理。
+        # P1-Fix-3：此处不隔离原文件；保存由调用方写盘闸门决定（无恢复源时整次拒绝）。
         return False
     pid = str(data.get("primary_story_id") or "")
     story = data.get("story")

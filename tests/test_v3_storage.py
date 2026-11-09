@@ -36,6 +36,15 @@ def _story(title="纸人替身", n=3):
             "characters": [], "scenes": [], "shots": shots}
 
 
+def _snapshot_tree(project):
+    """整个项目目录的「相对路径 → 文件字节」集合（含空目录），用于零写入断言。"""
+    project = Path(project)
+    files = {str(p.relative_to(project)): p.read_bytes()
+             for p in project.rglob("*") if p.is_file()}
+    dirs = {str(p.relative_to(project)) for p in project.rglob("*") if p.is_dir()}
+    return {"files": files, "dirs": dirs}
+
+
 class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="ahs_v3_"))
@@ -631,13 +640,13 @@ class P1FixCorruptRecoveryTest(_Base):
         (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
                                               encoding="utf-8")
         vm = v3.V3ProjectManager(project)
+        before = _snapshot_tree(project)
         with self.assertRaises(v3.CorruptDataError):
             vm.load(dict(raw))
-        # 原始字节一字未丢：损坏文件先备份进 .corrupt/，再以损坏离开原位置
-        self.assertFalse(broken.exists())
-        backups = list((project / ".corrupt").glob("story.json.*.bak"))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(backups[0].read_bytes(), b'{"broken": ')
+        # P1-Fix-3：V3 层只读判定——不隔离、不删除、不创建 .corrupt/
+        self.assertEqual(_snapshot_tree(project), before)
+        self.assertTrue(broken.exists())
+        self.assertFalse((project / ".corrupt").exists())
         # V2 界面仍能打开项目（V3 失败不能挡住 V2）
         self.assertEqual(self.pm.get_story(self.pm.load(project))["shots"], "not-a-list")
 
@@ -681,14 +690,17 @@ class P1FixCorruptRecoveryTest(_Base):
         self.assertNotEqual((project / "project.json").read_bytes(), before)
 
     def test_quarantine_failure_does_not_touch_original(self):
+        # P1-Fix-3：隔离发生在写盘闸门；隔离失败 → 整个打开流程零业务写入，
+        # 原文件字节不变（无恢复源时打开本身就零写入，另有专项测试覆盖）。
         project = self._project()
         self.pm.set_story(project, _story(n=3))
-        path = self._corrupt_primary(project)
-        with mock.patch.object(v3, "shutil") as fake_shutil:
-            fake_shutil.copy2.side_effect = OSError("磁盘满")
-            with self.assertRaises(v3.RepositoryError):
-                v3.V3ProjectManager(project).load(self._raw(project))
+        path = self._corrupt_primary(project)          # project.json 有效：有恢复源
+        before = _snapshot_tree(project)
+        with mock.patch.object(v3.shutil, "copy2", side_effect=OSError("磁盘满")):
+            with self.assertRaises((v3.RepositoryError, OSError, ProjectError)):
+                self.pm.open_project(project)
         self.assertEqual(path.read_bytes(), b'{"broken": ')
+        self.assertEqual(_snapshot_tree(project), before)   # 零写入
 
 
 class P1ScopeTest(unittest.TestCase):
@@ -793,7 +805,7 @@ class P1Fix2CorruptJudgeTest(_Base):
 
     def test_structural_bad_no_history_raises_and_keeps_bytes(self):
         # 双侧结构损坏（project.json 的 shots 不是列表）且无快照：明确报错，
-        # 原始字节全部保留（隔离进 .corrupt/），绝不用空骨架覆盖。
+        # 原始字节全部保留（P1-Fix-3：原位不动，不隔离、不删除），绝不用空骨架覆盖。
         project = self._project()
         self.pm.set_story(project, _story(n=3))
         bad = json.dumps({"shots": None})
@@ -805,34 +817,31 @@ class P1Fix2CorruptJudgeTest(_Base):
         raw["story"] = {"schema_version": 2, "title": "坏", "shots": "not-a-list"}
         (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
                                               encoding="utf-8")
-        before = {p: p.read_bytes() for p in project.rglob("*") if p.is_file()}
-        before.pop(path)                                 # 该文件会被原样隔离
+        before = _snapshot_tree(project)
         with self.assertRaises((v3.CorruptDataError, ProjectError)) as ctx:
             self.pm.open_project(project)
         # 明确报「无法恢复」的损坏，而不是把失败伪装成「没有故事 / 正常空项目」
         self.assertIn("结构无效", str(ctx.exception))
-        self.assertIn("未被覆盖", str(ctx.exception))
-        after = {p: p.read_bytes() for p in project.rglob("*") if p.is_file()}
-        for target in before:
-            self.assertEqual(after[target], before[target])   # 其它文件一字未动
-        self.assertFalse(path.exists())                       # 先隔离，原位置不留坏文件
-        backups = list((project / ".corrupt").glob("story.json.*.bak"))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(backups[0].read_bytes(), bad.encode("utf-8"))
+        self.assertIn("保持原位", str(ctx.exception))
+        self.assertEqual(_snapshot_tree(project), before)     # 全项目字节零变化
+        self.assertEqual(path.read_bytes(), bad.encode("utf-8"))
+        self.assertFalse((project / ".corrupt").exists())
         # project.json 的坏 story 原样保留（未采用、未改写）
         self.assertEqual(json.loads((project / "project.json").read_text("utf-8"))["story"],
                          {"schema_version": 2, "title": "坏", "shots": "not-a-list"})
     def test_quarantine_failure_aborts_without_any_write(self):
+        # V3 层只读：隔离失败在这里已不适用；真正的隔离闸门失败见 P1Fix3QuarantineFailTest
         project = self._project()
         self.pm.set_story(project, _story(n=3))
         path = project / "stories/story/story.json"
         path.write_text(json.dumps({"shots": "bad"}), encoding="utf-8")
-        before = {p: p.read_bytes() for p in project.rglob("*") if p.is_file()}
+        before = _snapshot_tree(project)
         with mock.patch.object(v3.shutil, "copy2", side_effect=OSError("磁盘满")):
-            with self.assertRaises(v3.RepositoryError):
-                v3.V3ProjectManager(project).load(self._raw(project))
-        after = {p: p.read_bytes() for p in project.rglob("*") if p.is_file()}
-        self.assertEqual(after, before)              # 隔离失败 → 不进行任何写入
+            data = self._raw(project)
+            data = v3.V3ProjectManager(project).load(data)[0]
+        self.assertEqual(data["_v3_adopt"]["shots"][0]["index"], 1)   # 仅内存采纳
+        after = _snapshot_tree(project)
+        self.assertEqual(after, before)              # 只读判定：零写入
 
     def test_open_get_story_save_reopen_preserves_original_bytes(self):
         project = self._project()
@@ -854,17 +863,31 @@ class P1Fix2CorruptJudgeTest(_Base):
         path = project / "stories/story/story.json"
         path.write_bytes(b'{"broken": ')
         self.pm.open_project(project)
+        # P1-Fix-3：无恢复源 → 只读判定，不隔离、不删除、零写入
         self.assertEqual(self.pm.recovery_status["state"], "partial")
         self.assertIn("未从 versions/ 覆盖", self.pm.recovery_status["reason"])
-        self.assertEqual(len(list((project / ".corrupt").glob("story.json.*.bak"))), 1)
-        self.assertFalse(path.exists())         # 打开时不会把当前状态写回去覆盖
+        self.assertEqual(path.read_bytes(), b'{"broken": ')  # 原始字节原位保留
+        self.assertFalse((project / ".corrupt").exists())
         data = self.pm.load(project)
-        self.pm.save(project, data)             # 显式保存同样不重建故事文件
-        self.assertFalse(path.exists())
+        self.assertIsNone(self.pm.get_story(data))   # 损坏文件不当作故事
+        # 打开流程已对账并保持零写入：原始文件、project.json 的 story 字段都未被改动
+        # （独立于打开流程的 save 不再持有 V3 上下文，故这里只断言「损坏文件不被触碰」）
+        data = self.pm.migrate(self.pm.load(project))[0]
+        self.pm.save(project, data)
+        self.assertEqual(path.read_bytes(), b'{"broken": ')
+        self.assertFalse((project / ".corrupt").exists())
         raw = self._raw(project)
         self.assertNotIn("recovery_status", raw)      # 恢复状态只留在内存
         self.assertNotIn("_not_recovered", raw)
         self.assertFalse(raw.get("story"))
+        # 用户手工修复后正常保存即可
+        path.write_text(json.dumps(dict(v3.new_story(story_id="story",
+                                                     project_id="V3项目"),
+                                        schema_version=2)), encoding="utf-8")
+        data = self.pm.migrate(self.pm.load(project))[0]
+        self.pm.save(project, data)
+        self.pm.open_project(project)
+        self.assertIsNone(self.pm.recovery_status)
 
 
 class P1Fix2VersionRebuildTest(_Base):
@@ -1108,3 +1131,251 @@ class P1Fix2TaskBoundaryTest(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+class P1Fix3QuarantineGateTest(_Base):
+    """P1-Fix-3：隔离推迟到「确认恢复源、即将写盘」的闸门（方案 A）。
+
+    规则 1：双侧损坏且无恢复源 → 报错 + 全项目字节零变化；
+    规则 2：有恢复源 → 先隔离，隔离成功后才写盘；
+    规则 3：隔离失败 → 中止，不写任何业务文件；
+    规则 4：正常 V2 / V3 / 未来版本 / 旧行为不回退。
+    """
+
+    def _primary(self, project):
+        return project / "stories" / "story" / "story.json"
+
+    def _corrupt_primary(self, project):
+        path = self._primary(project)
+        path.write_bytes(b'{"broken": ')
+        return path
+
+    def _business(self, project):
+        """项目内文件字节集合（排除运行期 .tasks/）。"""
+        project = Path(project)
+        return {str(p.relative_to(project)): p.read_bytes()
+                for p in project.rglob("*")
+                if p.is_file() and ".tasks" not in p.parts}
+
+    def _both_broken_no_snapshot(self):
+        """stories/ 损坏 + project.json story 结构坏 + 无 versions/ 可用快照。"""
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))       # 先有内容，再制造双侧损坏
+        path = self._corrupt_primary(project)
+        for entry in (project / "versions").glob("*.json"):
+            entry.unlink()
+        raw = self._raw(project)
+        raw["story"] = {"schema_version": 2, "title": "坏", "shots": "not-a-list"}
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        return project, path
+
+    # 1 ---------------------------------------------------------------
+    def test_rule1_both_broken_no_snapshot_raises_and_zero_bytes(self):
+        project, path = self._both_broken_no_snapshot()
+        before = _snapshot_tree(project)
+        with self.assertRaises(ProjectError) as ctx:
+            self.pm.open_project(project)
+        self.assertIn("无法恢复", str(ctx.exception))
+        self.assertIn("保持原位", str(ctx.exception))
+        self.assertEqual(_snapshot_tree(project), before)      # 全项目零变化
+        self.assertTrue(path.exists())                          # 原始文件原位
+        self.assertEqual(path.read_bytes(), b'{"broken": ')
+        self.assertFalse((project / ".corrupt").exists())       # 不做备份
+        self.assertEqual(self._raw(project)["story"]["shots"], "not-a-list")
+
+    # 2 ---------------------------------------------------------------
+    def test_rule1_repeated_open_is_stable(self):
+        project, path = self._both_broken_no_snapshot()
+        before = _snapshot_tree(project)
+        for _ in range(2):
+            with self.assertRaises(ProjectError):
+                self.pm.open_project(project)
+            self.assertEqual(_snapshot_tree(project), before)
+        self.assertEqual(path.read_bytes(), b'{"broken": ')
+        self.assertFalse((project / ".corrupt").exists())
+
+    # 3 ---------------------------------------------------------------
+    def test_rule2_with_snapshot_recovers_and_quarantines(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        self.pm.save_version(project, self.pm.load(project), note="基线")
+        self._corrupt_primary(project)
+        raw = self._raw(project)
+        raw["story"] = {"schema_version": 2, "title": "坏", "shots": "not-a-list"}
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        self.pm.open_project(project)                           # 恢复流程
+        story = self._story_file(project)
+        self.assertEqual(len(story["shots"]), 3)                # 恢复成功
+        backups = list((project / ".corrupt").glob("story.json.*.bak"))
+        self.assertEqual(len(backups), 1)                       # 原始字节被隔离
+        self.assertEqual(backups[0].read_bytes(), b'{"broken": ')
+        self.assertEqual(self.pm.recovery_status["state"], "recovered")
+
+    # 3b --------------------------------------------------------------
+    def test_marker_consumed_after_recovery_other_project_untouched(self):
+        # 同一实例恢复过一个项目之后，再操作另一个正常项目：绝不误隔离
+        broken = self._project(name="损坏项目")
+        self.pm.set_story(broken, _story(n=3))
+        self._corrupt_primary(broken)
+        self.pm.open_project(broken)                      # 有恢复源：恢复 + 隔离
+        self.assertEqual(len(list((broken / ".corrupt").glob("*.bak"))), 1)
+        other = self._project(name="正常项目")
+        self.pm.set_story(other, _story(n=2))
+        before = _snapshot_tree(other)
+        self.pm.open_project(other)
+        self.pm.save(other, self.pm.load(other))
+        self.assertFalse((other / ".corrupt").exists())   # 没被误隔离
+        self.assertEqual(len(self._story_file(other)["shots"]), 2)
+        self.assertIsNone(self.pm._pending_quarantine)    # 标记已消费/清除
+        self.assertFalse(self.pm._pending_authoritative)
+        self.assertNotEqual(_snapshot_tree(other), before)
+
+    # 4 ---------------------------------------------------------------
+    def test_rule2_project_json_preferred_and_content_kept(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3, title="存活的故事"))
+        self.pm.save_version(project, self.pm.load(project), note="基线")
+        path = self._corrupt_primary(project)                  # project.json 仍有效
+        self.pm.open_project(project)
+        story = self._story_file(project)
+        self.assertEqual(story["title"], "存活的故事")
+        self.assertEqual(len(story["shots"]), 3)
+        backups = list((project / ".corrupt").glob("story.json.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b'{"broken": ')
+        self.assertNotEqual(path.read_bytes(), b'{"broken": ')  # 恢复内容已写回
+
+    # 5 ---------------------------------------------------------------
+    def test_rule3_quarantine_failure_writes_no_business_file(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        path = self._corrupt_primary(project)                  # 有恢复源
+        before = _snapshot_tree(project)
+        with mock.patch.object(v3.shutil, "copy2", side_effect=OSError("磁盘满")):
+            with self.assertRaises((v3.RepositoryError, OSError, ProjectError)):
+                self.pm.open_project(project)
+        self.assertEqual(_snapshot_tree(project), before)      # 业务文件零写入
+        self.assertEqual(path.read_bytes(), b'{"broken": ')
+
+    # 6 ---------------------------------------------------------------
+    def test_rule4_v2_project_migration_unchanged(self):
+        project = self.tmp / "v2普通项目"
+        for sub in ("images", "audio", "subtitles", "output", "temp", "versions"):
+            (project / sub).mkdir(parents=True)
+        (project / "project.json").write_text(json.dumps({
+            "schema_version": 2, "name": "v2普通项目", "created_at": "2026-01-01T00:00:00",
+            "settings": {}, "shots": [], "narration": None, "music": None,
+            "subtitle": None, "story": _story(title="V2 故事")},
+            ensure_ascii=False), encoding="utf-8")
+        self.pm.open_project(project)
+        raw = self._raw(project)
+        self.assertEqual(raw["schema_version"], v3.V3_SCHEMA_VERSION)
+        self.assertEqual(raw["story"]["title"], "V2 故事")
+        self.assertEqual(len(self._story_file(project)["shots"]), 3)
+        self.assertFalse((project / ".corrupt").exists())      # 没有误报隔离
+
+    # 7 ---------------------------------------------------------------
+    def test_rule4_normal_v3_open_save_reopen(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        self.pm.open_project(project)
+        self.assertIsNone(self.pm.recovery_status)
+        self.assertFalse((project / ".corrupt").exists())
+        data = self.pm.load(project)
+        data["story"]["title"] = "改名后"
+        self.pm.save(project, data)
+        self.pm.open_project(project)
+        self.assertEqual(self._story_file(project)["title"], "改名后")
+        self.assertIsNone(self.pm.recovery_status)
+        self.assertFalse((project / ".corrupt").exists())
+
+    # 8 ---------------------------------------------------------------
+    def test_rule4_partial_protection_not_regressed(self):
+        project = self._project()                               # 合法空故事
+        path = self._corrupt_primary(project)
+        before = _snapshot_tree(project)
+        self.pm.open_project(project)                           # 无恢复源：零写入
+        self.assertEqual(self.pm.recovery_status["state"], "partial")
+        self.assertEqual(_snapshot_tree(project), before)
+        self.assertEqual(path.read_bytes(), b'{"broken": ')
+        self.assertFalse((project / ".corrupt").exists())
+
+    # 9 ---------------------------------------------------------------
+    def test_rule4_non_open_paths_unaffected(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        self.assertFalse((project / ".corrupt").exists())
+        # save_version / restore_version / add_images / clear_story 均正常
+        entry = self.pm.save_version(project, self.pm.load(project), note="v1")
+        self.pm.restore_version(project, entry["version_id"])
+        self.assertEqual(len(self._story_file(project)["shots"]), 3)
+        image = self.tmp / "01.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        added = self.pm.add_images(project, [image])
+        self.assertEqual(len(added), 1)
+        self.assertEqual(len(self._raw(project)["shots"]), 1)
+        self.pm.clear_story(project)
+        self.assertEqual(self._story_file(project)["shots"], [])
+        self.assertFalse((project / ".corrupt").exists())
+
+    def test_rule4_non_open_paths_keep_project_consistent(self):
+        # 与上一条相同的正常路径之外，再确认「正常 V3 项目在 save 后重新打开」稳定
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        self.pm.save(project, self.pm.load(project))
+        self.pm.open_project(project)
+        self.assertEqual(len(self._story_file(project)["shots"]), 2)
+        self.assertFalse((project / ".corrupt").exists())
+
+    # 10 --------------------------------------------------------------
+    def test_rule4_future_version_boundary_unchanged(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        raw = self._raw(project)
+        raw["schema_version"] = v3.V3_SCHEMA_VERSION + 1
+        raw["future_field"] = "保留"
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        before = _snapshot_tree(project)
+        self.pm.open_project(project)                           # 只读打开
+        self.assertEqual(_snapshot_tree(project), before)
+        kept = self._raw(project)
+        self.assertEqual(kept["schema_version"], v3.V3_SCHEMA_VERSION + 1)
+        self.assertEqual(kept["future_field"], "保留")
+        with self.assertRaises(ProjectReadOnlyError):
+            self.pm.save(project, self.pm.load(project))
+
+    # 11 --------------------------------------------------------------
+    def test_rule1_internal_markers_never_written(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        self.pm.save_version(project, self.pm.load(project), note="基线")
+        self._corrupt_primary(project)                          # 有恢复源：写入恢复
+        self.pm.open_project(project)
+        raw_text = (project / "project.json").read_text(encoding="utf-8")
+        story_text = self._primary(project).read_text(encoding="utf-8")
+        for marker in ("_pending_quarantine", "_quarantine_source", "_v3_adopt",
+                       "recovery_status", "_not_recovered", "_recovery_candidate",
+                       "_version_snapshot_due", "_v3_upgraded", "_pending_authoritative"):
+            self.assertNotIn(marker, raw_text)
+            self.assertNotIn(marker, story_text)
+
+    # 12 --------------------------------------------------------------
+    def test_rule2_versions_and_active_version_after_recovery(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        saved = self.pm.save_version(project, self.pm.load(project), note="基线")
+        self._corrupt_primary(project)
+        raw = self._raw(project)
+        raw["story"] = {"schema_version": 2, "title": "坏", "shots": "not-a-list"}
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        self.pm.open_project(project)
+        data = self.pm.load(project)
+        version_ids = {v["version_id"] for v in data["story"]["versions"]}
+        disk_ids = {p.stem for p in (project / "versions").glob("v*.json")}
+        self.assertEqual(version_ids, disk_ids)                 # 列表与磁盘一致
+        self.assertIn(data["story"]["active_version"], version_ids)   # active 指向真实版本
+        self.assertIn(saved["version_id"], version_ids)               # 基线快照未被丢弃
+        # 恢复后的 Story 快照与原版本内容一致
+        self.assertEqual(len(self._story_file(project)["shots"]), 3)
