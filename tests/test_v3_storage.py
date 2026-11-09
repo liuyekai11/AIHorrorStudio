@@ -1379,3 +1379,189 @@ class P1Fix3QuarantineGateTest(_Base):
         self.assertIn(saved["version_id"], version_ids)               # 基线快照未被丢弃
         # 恢复后的 Story 快照与原版本内容一致
         self.assertEqual(len(self._story_file(project)["shots"]), 3)
+class P1Fix3R1WriteOrderTest(_Base):
+    """P1-Fix-3-R1：打开 / 存版本的写盘副作用顺序，以及隔离失败清理。"""
+
+    def _broken_project_without_versions(self):
+        """双侧损坏、无可用快照、项目原本没有 versions/。"""
+        project = self._project()
+        self.pm.set_story(project, _story(n=3))
+        (project / "stories/story/story.json").write_bytes(b'{"broken": ')
+        for entry in (project / "versions").glob("*.json"):
+            entry.unlink()
+        (project / "versions").rmdir()
+        raw = self._raw(project)
+        raw["story"] = {"schema_version": 2, "title": "坏", "shots": "not-a-list"}
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        self.assertFalse((project / "versions").exists())
+        return project
+
+    # 测试 A ------------------------------------------------------------
+    def test_open_failure_does_not_create_versions(self):
+        project = self._broken_project_without_versions()
+        before = _snapshot_tree(project)
+        with self.assertRaises(ProjectError):
+            self.pm.open_project(project)
+        self.assertFalse((project / "versions").exists())
+        self.assertEqual(_snapshot_tree(project), before)    # 文件 + 目录集合不变
+
+    def test_normal_open_keeps_versions_directory(self):
+        # 正常项目打开后 versions/ 仍存在（原有语义不回退）；只读打开不新增目录
+        project = self._project()
+        self.pm.open_project(project)
+        self.assertTrue((project / "versions").is_dir())
+        (project / "versions").rmdir()
+        self.pm.open_project(project)                        # 正常、无需写盘
+        self.assertFalse((project / "versions").exists())
+        # 需要写盘（V2 → V3 对账）时由写盘前创建
+        self.pm.set_story(project, _story(n=2))
+        self.assertTrue((project / "versions").is_dir())
+
+    # 测试 B ------------------------------------------------------------
+    def test_save_version_gate_failure_does_not_create_versions(self):
+        # 与打开流程一致：一次 migrate（V3 判定）→ 同一 data 直接 save_version。
+        # 独立的 load→migrate 不开 V3 上下文，不会产生待隔离标记（见 P1-Fix-3 设计）。
+        project = self._broken_project_without_versions()
+        raw = self._raw(project)
+        raw["story"] = _story(n=3)               # 有恢复源（project.json 可用）
+        (project / "project.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                              encoding="utf-8")
+        outer = self.pm._v3_context(project)
+        try:
+            data = self.pm.migrate(self.pm.load(project))[0]
+            data = self.pm.migrate(data)[0]      # V2 代码写法：二次 migrate 不会丢标记
+            self.assertTrue(self.pm._pending_quarantine is not None)
+            before = _snapshot_tree(project)
+            with mock.patch.object(v3.shutil, "copy2", side_effect=OSError("磁盘满")):
+                with self.assertRaises(ProjectError):
+                    self.pm.save_version(project, data, note="闸门失败")
+        finally:
+            self.pm._v3_restore(outer)
+        self.assertFalse((project / "versions").exists())    # 不创建空目录
+        self.assertEqual(_snapshot_tree(project), before)    # 业务文件零写入
+        self.assertEqual((project / "stories/story/story.json").read_bytes(),
+                         b'{"broken": ')
+
+    def test_save_version_normal_still_creates_versions(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        for entry in (project / "versions").glob("*.json"):
+            entry.unlink()
+        (project / "versions").rmdir()
+        self.assertFalse((project / "versions").exists())
+        entry = self.pm.save_version(project, self.pm.load(project), note="正常")
+        self.assertTrue((project / "versions" / f"{entry['version_id']}.json").exists())
+
+    # 测试 C ------------------------------------------------------------
+    def test_staging_replace_failure_leaves_no_files(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        path = project / "stories/story/story.json"
+        path.write_bytes(b'{"broken": ')
+        before = _snapshot_tree(project)
+        vm = v3.V3ProjectManager(project)
+        with mock.patch.object(Path, "replace",
+                               side_effect=OSError("rename 失败")):
+            self.assertIsNone(vm._quarantine_corrupt(path))
+        self.assertEqual(path.read_bytes(), b'{"broken": ')  # 原文件完整
+        self.assertFalse((project / ".corrupt").exists())    # 无 staging / 正式备份
+        self.assertEqual(_snapshot_tree(project), before)
+
+    def test_staging_replace_failure_keeps_history_backups(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        path = project / "stories/story/story.json"
+        path.write_bytes(b'{"broken": ')
+        root = project / ".corrupt"
+        root.mkdir()
+        history = root / "story.json.20200101-000000-000000.bak"
+        history.write_bytes(b'history')
+        vm = v3.V3ProjectManager(project)
+        with mock.patch.object(Path, "replace",
+                               side_effect=OSError("rename 失败")):
+            self.assertIsNone(vm._quarantine_corrupt(path))
+        self.assertTrue(root.is_dir())                       # 既有目录保留
+        self.assertEqual(sorted(p.name for p in root.iterdir()), [history.name])
+        self.assertEqual(history.read_bytes(), b'history')
+
+    # 测试 D ------------------------------------------------------------
+    def test_unlink_failure_removes_new_backup_and_keeps_original(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        path = project / "stories/story/story.json"
+        path.write_bytes(b'{"broken": ')
+        real_unlink = Path.unlink
+
+        def fake_unlink(self, *args, **kwargs):
+            if self == path:
+                raise OSError("文件被占用")
+            return real_unlink(self, *args, **kwargs)
+
+        vm = v3.V3ProjectManager(project)
+        with mock.patch.object(Path, "unlink", fake_unlink):
+            self.assertIsNone(vm._quarantine_corrupt(path))  # 没有返回成功
+        self.assertEqual(path.read_bytes(), b'{"broken": ')  # 原文件完整
+        self.assertFalse((project / ".corrupt").exists())    # 新 target / staging 已清
+
+    def test_unlink_failure_keeps_history_backups(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        path = project / "stories/story/story.json"
+        path.write_bytes(b'{"broken": ')
+        root = project / ".corrupt"
+        root.mkdir()
+        history = root / "story.json.20200101-000000-000000.bak"
+        history.write_bytes(b'history')
+        real_unlink = Path.unlink
+
+        def fake_unlink(self, *args, **kwargs):
+            if self == path:
+                raise OSError("文件被占用")
+            return real_unlink(self, *args, **kwargs)
+
+        vm = v3.V3ProjectManager(project)
+        with mock.patch.object(Path, "unlink", fake_unlink):
+            self.assertIsNone(vm._quarantine_corrupt(path))
+        self.assertEqual(sorted(p.name for p in root.iterdir()), [history.name])
+        self.assertEqual(history.read_bytes(), b'history')
+
+    # 测试 E ------------------------------------------------------------
+    def test_failure_cleanup_preserves_existing_corrupt_dir(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        path = project / "stories/story/story.json"
+        path.write_bytes(b'{"broken": ')
+        root = project / ".corrupt"
+        root.mkdir()
+        history = root / "old.bak"
+        history.write_bytes(b'old')
+        before = _snapshot_tree(project)
+        vm = v3.V3ProjectManager(project)
+        with mock.patch.object(v3.shutil, "copy2", side_effect=OSError("磁盘满")):
+            self.assertIsNone(vm._quarantine_corrupt(path))
+        self.assertEqual(_snapshot_tree(project), before)    # 目录与文件完全不变
+
+    def test_success_backs_up_original_bytes(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        path = project / "stories/story/story.json"
+        path.write_bytes(b'{"broken": ')
+        vm = v3.V3ProjectManager(project)
+        backup = vm._quarantine_corrupt(path)
+        self.assertIsNotNone(backup)
+        self.assertFalse(path.exists())                       # 隔离后移出原位置
+        self.assertEqual(backup.read_bytes(), b'{"broken": ')  # 原始字节完整备份
+        self.assertEqual(sorted(p.name for p in (project / ".corrupt").iterdir()),
+                         [backup.name])                     # 无 staging 残留
+
+    # 回归 --------------------------------------------------------------
+    def test_open_failure_repeatedly_never_creates_versions(self):
+        project = self._broken_project_without_versions()
+        before = _snapshot_tree(project)
+        for _ in range(2):
+            with self.assertRaises(ProjectError):
+                self.pm.open_project(project)
+        self.assertEqual(_snapshot_tree(project), before)
+        self.assertFalse((project / "versions").exists())
+        self.assertFalse((project / ".corrupt").exists())

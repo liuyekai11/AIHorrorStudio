@@ -977,14 +977,23 @@ class V3ProjectManager(Repository):
     def _quarantine_corrupt(self, path: Path) -> Path | None:
         """把损坏文件的原始字节搬到 .corrupt/（不删除、不覆盖）。返回备份路径。
 
-        P1-Fix-3：失败时保证**零残留**（不留半截 .bak、不创建空 .corrupt/）：
-        先在目标目录写一个随机临时名，copy2 成功后才 rename 成正式备份名，
-        最后才 unlink 原文件。任一环节失败 → 清理临时文件并返回 None，原文件不动。
+        顺序：copy2 原文件 → 随机临时名（staging）→ rename 成正式备份（target）
+        → 最后 unlink 原文件。只有全部成功才返回 target。
+
+        P1-Fix-3-R1（R1-03）：失败时尽最大努力回收**本次创建**的文件：
+        - copy2 失败：删 staging；
+        - rename 失败：删 staging；
+        - 原文件 unlink 失败：删本次的 target（历史备份不动），原文件保持完整；
+        - 本次创建的 .corrupt/ 若因此变空则 rmdir。
+        清理本身也可能失败（文件被占用等）。此时返回 None，并通过项目内
+        `.corrupt/` 里的残留文件如实暴露（不伪造零残留、不声称成功）。
+        操作开始前已存在的 .corrupt/ 文件与历史备份永远不动。
         """
         path = Path(path)
         root = self.project / ".corrupt"
         created_dir = not root.exists()
         staging = None
+        target = None
         try:
             if not path.exists():
                 return None
@@ -998,11 +1007,15 @@ class V3ProjectManager(Repository):
             path.unlink()
             return target
         except OSError:
-            if staging is not None:
+            for leftover in (staging, target):
+                if leftover is None:
+                    continue
                 try:
-                    staging.unlink()
-                except OSError:
+                    leftover.unlink()
+                except FileNotFoundError:
                     pass
+                except OSError:
+                    pass            # 清理失败：残留如实可见，不声称零残留
             if created_dir:
                 try:
                     root.rmdir()          # 本次创建的 .corrupt/ 失败后不留下

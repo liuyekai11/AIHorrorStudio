@@ -373,7 +373,11 @@ class ProjectManager:
         project = Path(project)
         if not (project / PROJECT_FILE).exists():
             raise ProjectError("所选目录中没有 project.json，请选择正确的项目文件夹。")
-        (project / VERSIONS_DIR).mkdir(parents=True, exist_ok=True)
+        # P1-Fix-3-R1（R1-01）：打开阶段不创建任何目录。以前这里无条件 mkdir
+        # versions/，导致「打开失败」也会改变项目结构（违反「失败打开零影响」）。
+        # versions/ 由真正需要写快照的路径在写盘之前创建（save_version）；只有
+        # 这次打开确定会写盘时，才预先创建，保持「正常项目打开后 versions/ 存在」
+        # 的原有语义。
         outer = self._v3_context(project)
         self._opening = True
         self._snapshot_written = False
@@ -390,6 +394,9 @@ class ProjectManager:
         data = self._migrate_with_v3(project, data)
         due = bool(data.pop("_version_snapshot_due", False))
         if due and data.get("story") and not self._snapshot_written:
+            # P1-Fix-3-R1：升级快照会写 versions/，且 save_version 只接受已存在的
+            # 项目目录——这是本次打开确定会写盘的唯一分支，在此创建 versions/。
+            (project / VERSIONS_DIR).mkdir(parents=True, exist_ok=True)
             # 升级后的结构存一份快照（save_version 会连同 story 一起写盘）
             self._snapshot_written = True
             try:
@@ -1095,12 +1102,18 @@ class ProjectManager:
         if not isinstance(versions, list):
             versions = story["versions"] = []
         root = self._versions_root(project)
-        root.mkdir(parents=True, exist_ok=True)
+        created_dir = False
+        snapshot_written = False
         try:
             # P1-Fix-3：写盘闸门——在生成版本文件之前先隔离待隔离的损坏 stories/
             # 文件（隔离失败 → 零业务写入）。调用方已从 stories/ / project.json 恢复出
             # 内存 story（即恢复源已确认），本次写盘包含恢复结果。
+            # P1-Fix-3-R1（R1-02）：闸门必须在 makedirs 之前——隔离失败时不得留下
+            # 空 versions/（目录结构零变化）。
             self._guard_pending_quarantine(project, data)
+            if not root.exists():
+                root.mkdir(parents=True, exist_ok=True)
+                created_dir = True
             version_id = f"v{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
             snapshot = copy.deepcopy(story)
             for key in _V3_OWN_KEYS:      # V3 自有字段只属于 stories/，不进快照
@@ -1115,6 +1128,15 @@ class ProjectManager:
             tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2),
                            encoding="utf-8")
             tmp.replace(target)
+            snapshot_written = True
+        except BaseException:
+            if created_dir and not snapshot_written:
+                # 本次创建、且没有写入版本文件：撤掉空目录（尽力而为，失败不掩盖原因）
+                try:
+                    root.rmdir()
+                except OSError:
+                    pass
+            raise
         finally:
             # 标记已被闸门消费（隔离完成）或隔离失败中止：都不允许残留
             self._release_pending_quarantine()

@@ -263,4 +263,4 @@ OK
 - 只提交 `modules/project_manager.py`、`modules/v3_storage.py`、`tests/test_v3_storage.py`
   与本报告；未 push / reset / clean / rebase / amend；未使用 `git add -A`；
   所有既有未跟踪文件原样保留。
-- 提交 SHA：见交付消息（提交后以 `git log -1 --format=%H` 为准）。
+- 提交 SHA：`29422dd7126685129ba834a76180869e35f18b19`（parent `5f94261a79688cade26cd63a9c63aa5c4d2401ab`）。
