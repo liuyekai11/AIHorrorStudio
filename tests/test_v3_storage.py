@@ -1455,20 +1455,23 @@ class P1Fix3R1WriteOrderTest(_Base):
 
     # 测试 C ------------------------------------------------------------
     def test_staging_replace_failure_leaves_no_files(self):
+        # P1-Fix-3-R2（R2-02）：正式备份的落成点由 Path.replace 改为
+        # os.link 独占创建；失败注入点随机制迁移，断言强度保持不变。
         project = self._project()
         self.pm.set_story(project, _story(n=2))
         path = project / "stories/story/story.json"
         path.write_bytes(b'{"broken": ')
         before = _snapshot_tree(project)
         vm = v3.V3ProjectManager(project)
-        with mock.patch.object(Path, "replace",
-                               side_effect=OSError("rename 失败")):
+        with mock.patch.object(v3.os, "link",
+                               side_effect=OSError("link 失败")):
             self.assertIsNone(vm._quarantine_corrupt(path))
         self.assertEqual(path.read_bytes(), b'{"broken": ')  # 原文件完整
         self.assertFalse((project / ".corrupt").exists())    # 无 staging / 正式备份
         self.assertEqual(_snapshot_tree(project), before)
 
     def test_staging_replace_failure_keeps_history_backups(self):
+        # P1-Fix-3-R2（R2-02）：同上，mock 点迁移到 os.link。
         project = self._project()
         self.pm.set_story(project, _story(n=2))
         path = project / "stories/story/story.json"
@@ -1478,8 +1481,8 @@ class P1Fix3R1WriteOrderTest(_Base):
         history = root / "story.json.20200101-000000-000000.bak"
         history.write_bytes(b'history')
         vm = v3.V3ProjectManager(project)
-        with mock.patch.object(Path, "replace",
-                               side_effect=OSError("rename 失败")):
+        with mock.patch.object(v3.os, "link",
+                               side_effect=OSError("link 失败")):
             self.assertIsNone(vm._quarantine_corrupt(path))
         self.assertTrue(root.is_dir())                       # 既有目录保留
         self.assertEqual(sorted(p.name for p in root.iterdir()), [history.name])
@@ -1565,3 +1568,303 @@ class P1Fix3R1WriteOrderTest(_Base):
         self.assertEqual(_snapshot_tree(project), before)
         self.assertFalse((project / "versions").exists())
         self.assertFalse((project / ".corrupt").exists())
+
+
+def _legacy_upgrade_project(pm, parent, n=3):
+    """造一个「磁盘属 V3、project.json 里 story 仍是旧结构 1」的项目。
+
+    打开时会触发结构升级，从而进入 ``_open_project`` 的升级快照分支。
+    返回 ``(project, stories/<id>/story.json 路径)``。
+    """
+    project = pm.create_project(Path(parent), "legacy")
+    pm.set_story(project, _story(n=n))
+    for entry in (project / "versions").glob("*"):
+        entry.unlink()
+    (project / "versions").rmdir()                       # 基线：versions/ 不存在
+    raw = json.loads((project / "project.json").read_text(encoding="utf-8"))
+    raw["schema_version"] = SCHEMA_VERSION
+    story = raw["story"]
+    story["schema_version"] = 1
+    for i, shot in enumerate(story["shots"], 1):
+        shot["index"] = i
+    (project / "project.json").write_text(
+        json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    sid = raw["primary_story_id"]
+    return project, project / "stories" / sid / "story.json"
+
+
+class P1Fix3R2UpgradeBranchTest(_Base):
+    """P1-Fix-3-R2（R2-01）：升级快照分支不得提前创建 versions/。
+
+    2 项测试：
+    - ``test_upgrade_snapshot_gate_failure_does_not_create_versions``：失败路径
+      （分支内出现损坏 + 隔离失败）不留空 ``versions/``、目录树逐字节不变；
+    - ``test_upgrade_snapshot_success_path_quarantines_once_then_writes``：成功路径
+      （打开前后即存在损坏）真实隔离一次并写入升级快照。
+    """
+
+    def test_upgrade_snapshot_gate_failure_does_not_create_versions(self):
+        project, story_path = _legacy_upgrade_project(self.pm, self.tmp)
+        self.assertFalse((project / "versions").exists())
+        self.assertFalse((project / ".corrupt").exists())
+
+        # 首次 _migrate_with_v3 是分支前的合法升级写盘（due=True 必然写盘）；
+        # 在它返回之后把 stories/ 主文件写坏，让待隔离标记只可能在**分支内**
+        # 的第二次 _migrate_with_v3 → _v3_load 中产生。
+        orig = self.pm._migrate_with_v3
+        state = {"calls": 0, "branch_entry": None}
+
+        def spy(proj, data):
+            state["calls"] += 1
+            out = orig(proj, data)
+            if state["calls"] == 1:
+                story_path.write_bytes(b'{"broken": ')
+                state["branch_entry"] = _snapshot_tree(project)
+            return out
+
+        self.pm._migrate_with_v3 = spy
+        try:
+            with mock.patch.object(v3.V3ProjectManager, "_quarantine_corrupt",
+                                   return_value=None):      # 模拟隔离失败
+                result = self.pm.open_project(project)
+        finally:
+            self.pm._migrate_with_v3 = orig
+
+        # 1) 真的进过升级快照分支（_snapshot_written 只在该分支内被置 True）
+        self.assertGreaterEqual(state["calls"], 2)
+        self.assertIsNotNone(state["branch_entry"])
+        self.assertTrue(self.pm._snapshot_written)
+        # 2) 容错语义：隔离失败不阻止打开
+        self.assertEqual(result, project)
+        # 3) 关键断言：分支内没有提前创建 versions/
+        self.assertFalse((project / "versions").exists())
+        # 4) 分支内失败之后，整棵目录树与分支入口状态逐字节一致
+        self.assertEqual(_snapshot_tree(project), state["branch_entry"])
+        # 5) 原损坏文件保持原样，没有临时文件 / 目录残留
+        self.assertEqual(story_path.read_bytes(), b'{"broken": ')
+        self.assertFalse((project / ".corrupt").exists())
+
+    def test_upgrade_snapshot_success_path_quarantines_once_then_writes(self):
+        """R2-01 成功路径：真实隔离一次 → 恢复 → 升级快照写入。
+
+        场景（损坏在打开之前就存在，全程不 mock 闸门本身，也不 mock 隔离结果）：
+        project.json 里 story 是旧结构 1、stories/ 主文件已损坏。
+        打开时第一次 ``_migrate_with_v3`` 因 due=True 必然写盘，写盘闸门看到
+        pending marker，凭 ``_v3_adopt``（升级后的故事）确认为恢复源并**真实隔离**——
+        marker 在此被消费。其后预检闸门、分支内第二次 migrate 的写盘闸门、
+        ``save_version`` 内部的闸门都只能看到 marker=None，不得重复隔离。
+
+        说明：若升级项目在打开时并无损坏，第一次 migrate 写盘时 marker 尚未产生，
+        预检闸门会看到 marker=None。由于 ``due=True`` 时第一次 ``_migrate_with_v3``
+        总会调用 ``save()``，marker 不可能「活着」抵达预检闸门——预检属于防御性
+        检查；本测试覆盖的是 marker 在真实流程中被闸门消费一次后的完整成功链路。
+        """
+        project, story_path = _legacy_upgrade_project(self.pm, self.tmp)
+        story_path.write_bytes(b'{"broken": ')
+        original = b'{"broken": '
+
+        orig_gate = ProjectManager._guard_pending_quarantine
+        orig_q = v3.V3ProjectManager._quarantine_corrupt
+        orig_sv = self.pm.save_version
+        gates = []
+        quarantines = []
+        versions = []
+
+        def gate_spy(pm, proj, data=None):
+            data = data if isinstance(data, dict) else {}
+            rec = {"marker": pm._pending_quarantine is not None,
+                   "file_exists": pm._pending_quarantine is not None
+                   and pm._pending_quarantine[1].exists()}
+            gates.append(rec)
+            try:
+                out = orig_gate(pm, proj, data)
+            except BaseException as exc:
+                rec["result"] = type(exc).__name__
+                rec["marker_after"] = pm._pending_quarantine
+                raise
+            rec["result"] = "ok"
+            rec["marker_after"] = pm._pending_quarantine
+            return out
+
+        def q_spy(vm, path):
+            out = orig_q(vm, path)
+            quarantines.append((Path(path), out))
+            return out
+
+        def sv_spy(proj, data, note="", official=True):
+            versions.append(note)
+            return orig_sv(proj, data, note=note, official=official)
+
+        ProjectManager._guard_pending_quarantine = gate_spy
+        self.pm.save_version = sv_spy
+        try:
+            with mock.patch.object(v3.V3ProjectManager, "_quarantine_corrupt",
+                                   q_spy):
+                result = self.pm.open_project(project)
+        finally:
+            ProjectManager._guard_pending_quarantine = orig_gate
+            self.pm.save_version = orig_sv
+
+        # 1) 真的进过升级快照分支（_snapshot_written 只在该分支内置 True）
+        self.assertTrue(self.pm._snapshot_written)
+        self.assertEqual(result, project)
+        # 2) 全程只隔离一次，且隔离的就是损坏的 stories/ 主文件
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0][0], story_path)
+        backup = quarantines[0][1]
+        self.assertIsNotNone(backup)
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertFalse(story_path.read_bytes() == original)   # 已恢复重写
+        # 3) marker 状态：第一次闸门看到 marker，消费后所有闸门都看到 None
+        # 闸门恰好 5 次（实测确认的调用链，多一次少一次都说明链路被改动）：
+        #   #1 第一次 _migrate_with_v3 内部的写盘闸门（save → _save）
+        #   #2 _open_project 的预检闸门（:402）
+        #   #3 第二次 _migrate_with_v3 内部的写盘闸门
+        #   #4 save_version 自身的写盘闸门
+        #   #5 save_version 收尾 save() 的写盘闸门
+        self.assertEqual(len(gates), 5)
+        self.assertTrue(gates[0]["marker"])
+        self.assertTrue(gates[0]["file_exists"])
+        self.assertEqual(gates[0]["result"], "ok")
+        self.assertIsNone(gates[0]["marker_after"])
+        for rec in gates[1:]:
+            self.assertFalse(rec["marker"])
+            self.assertIsNone(rec["marker_after"])
+        self.assertIsNone(self.pm._pending_quarantine)
+        # 4) save_version 以升级快照的身份写入（内部闸门在第 3 项已覆盖）
+        self.assertEqual(versions, ["V2.2 结构升级"])
+        # 5) 快照真实落盘：versions/ 有一份快照，内容是升级后的 3 镜故事
+        snapshots = list((project / "versions").glob("*.json"))
+        self.assertEqual(len(snapshots), 1)
+        snap = json.loads(snapshots[0].read_text(encoding="utf-8"))
+        self.assertEqual(snap["note"], "V2.2 结构升级")
+        self.assertEqual(len(snap["shots"]), 3)
+        self.assertNotIn("versions", snap)
+        # 6) 项目状态正确：stories/ 恢复为当前结构；project.json 可解析且指向同一主 Story
+        restored = json.loads(story_path.read_text(encoding="utf-8"))
+        self.assertEqual(restored["schema_version"], STORY_SCHEMA_VERSION)
+        self.assertEqual(len(restored["shots"]), 3)
+        self.assertIn("story", self._raw(project))
+        # 7) .corrupt/ 只有本次那一份备份，无 staging 残留
+        names = sorted(p.name for p in (project / ".corrupt").iterdir())
+        self.assertEqual(names, [backup.name])
+
+
+class P1Fix3R2QuarantineNoOverwriteTest(_Base):
+    """P1-Fix-3-R2（R2-02）：备份文件的独占创建，任何冲突都不得覆盖历史备份。"""
+
+    def _broken(self):
+        project = self._project()
+        self.pm.set_story(project, _story(n=2))
+        path = project / "stories/story/story.json"
+        path.write_bytes(b'{"broken": ')
+        return project, path
+
+    @staticmethod
+    def _fixed_clock():
+        """把 v3.datetime 固定成一个可预测的时间戳。"""
+        import datetime as _dt
+
+        class FixedDT(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return _dt.datetime(2020, 1, 1, 0, 0, 0, 123456)
+
+        patcher = mock.patch.object(v3, "datetime", FixedDT)
+        return patcher
+
+    def test_target_name_conflict_never_overwrites_history(self):
+        # 测试 A：首个候选名与历史备份同名 → 换名，历史字节不变
+        project, path = self._broken()
+        root = project / ".corrupt"
+        root.mkdir()
+        history = root / "story.json.20200101-000000-123456.bak"
+        history.write_bytes(b'history')
+        vm = v3.V3ProjectManager(project)
+        with self._fixed_clock():
+            backup = vm._quarantine_corrupt(path)
+        self.assertIsNotNone(backup)
+        self.assertNotEqual(backup, history)                  # 没有占用历史文件
+        self.assertEqual(history.read_bytes(), b'history')    # 历史字节不变
+        self.assertEqual(backup.read_bytes(), b'{"broken": ')  # 新备份内容正确
+        self.assertFalse(path.exists())
+        names = sorted(p.name for p in root.iterdir())
+        self.assertEqual(len(names), 2)                       # 无 staging 残留
+        self.assertEqual([n for n in names if n.endswith(".tmp")], [])
+
+    def test_conflict_then_failure_leaves_history_and_cleans_own_files(self):
+        # 测试 B：冲突换名成功，但原文件 unlink 失败 → 仍返回 None；
+        # 历史备份不动；只清理本次创建的文件；原文件完整。
+        project, path = self._broken()
+        root = project / ".corrupt"
+        root.mkdir()
+        history = root / "story.json.20200101-000000-123456.bak"
+        history.write_bytes(b'history')
+        real_unlink = Path.unlink
+
+        def fake_unlink(self, *args, **kwargs):
+            if self == path:
+                raise OSError("文件被占用")
+            return real_unlink(self, *args, **kwargs)
+
+        vm = v3.V3ProjectManager(project)
+        with self._fixed_clock(), mock.patch.object(Path, "unlink", fake_unlink):
+            self.assertIsNone(vm._quarantine_corrupt(path))
+        self.assertEqual(path.read_bytes(), b'{"broken": ')    # 原文件完整
+        self.assertEqual(sorted(p.name for p in root.iterdir()), [history.name])
+        self.assertEqual(history.read_bytes(), b'history')     # 本次 target 已删，历史不动
+
+    def test_repeated_conflicts_never_overwrite_and_all_history_intact(self):
+        # 测试 C：连续三次冲突（os.link 前两次抛 FileExistsError 后才真落盘）；
+        # 任何一次都不得覆盖历史备份。
+        project, path = self._broken()
+        root = project / ".corrupt"
+        root.mkdir()
+        history = root / "story.json.20200101-000000-123456.bak"
+        history.write_bytes(b'history')
+        real_link = os.link
+        seen = {"n": 0}
+
+        def flaky_link(src, dst, *args, **kwargs):
+            seen["n"] += 1
+            if seen["n"] <= 2:
+                raise FileExistsError("名称冲突")
+            return real_link(src, dst, *args, **kwargs)
+
+        vm = v3.V3ProjectManager(project)
+        with self._fixed_clock(), mock.patch.object(v3.os, "link", flaky_link):
+            backup = vm._quarantine_corrupt(path)
+        self.assertIsNotNone(backup)
+        self.assertEqual(seen["n"], 3)                         # 冲突 2 次 + 成功 1 次
+        self.assertEqual(history.read_bytes(), b'history')
+        self.assertEqual(backup.read_bytes(), b'{"broken": ')
+        self.assertFalse(path.exists())
+        names = sorted(p.name for p in root.iterdir())
+        self.assertEqual(len(names), 2)                        # 历史 + 本次备份
+        self.assertEqual([n for n in names if n.endswith(".tmp")], [])
+
+    def test_64_conflicts_safely_abort(self):
+        # 冲突耗尽：安全放弃，历史与目录树保持不变。
+        project, path = self._broken()
+        root = project / ".corrupt"
+        root.mkdir()
+        history = root / "story.json.20200101-000000-123456.bak"
+        history.write_bytes(b'history')
+        before = _snapshot_tree(project)
+        vm = v3.V3ProjectManager(project)
+        with self._fixed_clock(), mock.patch.object(v3.os, "link",
+                                                    side_effect=FileExistsError("冲突")):
+            self.assertIsNone(vm._quarantine_corrupt(path))
+        self.assertEqual(_snapshot_tree(project), before)      # 原文件 / 历史 / 目录不变
+
+    def test_success_backup_matches_original_and_no_staging_residue(self):
+        # 测试 D：正常成功——备份字节 == 原文件、原文件被移走、无 staging 残留。
+        project, path = self._broken()
+        original = path.read_bytes()
+        vm = v3.V3ProjectManager(project)
+        backup = vm._quarantine_corrupt(path)
+        self.assertIsNotNone(backup)
+        self.assertFalse(path.exists())
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertEqual(sorted(p.name for p in (project / ".corrupt").iterdir()),
+                         [backup.name])

@@ -394,9 +394,14 @@ class ProjectManager:
         data = self._migrate_with_v3(project, data)
         due = bool(data.pop("_version_snapshot_due", False))
         if due and data.get("story") and not self._snapshot_written:
-            # P1-Fix-3-R1：升级快照会写 versions/，且 save_version 只接受已存在的
-            # 项目目录——这是本次打开确定会写盘的唯一分支，在此创建 versions/。
-            (project / VERSIONS_DIR).mkdir(parents=True, exist_ok=True)
+            # P1-Fix-3-R2（R2-01）：这里不再提前 mkdir versions/。升级快照的目录由
+            # save_version 在写盘闸门成功之后自行创建；闸门失败时不留空目录。
+            # 先跑一遍写盘闸门（试运行），把「隔离失败 / 无恢复源」这类 ProjectError
+            # 在创建任何目录之前拦下；通过后由 save_version 正式隔离并写快照。
+            try:
+                self._guard_pending_quarantine(project, data)
+            except ProjectError:
+                return project          # 既有容错语义：升级快照失败不阻止打开
             # 升级后的结构存一份快照（save_version 会连同 story 一起写盘）
             self._snapshot_written = True
             try:

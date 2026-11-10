@@ -977,32 +977,54 @@ class V3ProjectManager(Repository):
     def _quarantine_corrupt(self, path: Path) -> Path | None:
         """把损坏文件的原始字节搬到 .corrupt/（不删除、不覆盖）。返回备份路径。
 
-        顺序：copy2 原文件 → 随机临时名（staging）→ rename 成正式备份（target）
-        → 最后 unlink 原文件。只有全部成功才返回 target。
+        当前实现（P1-Fix-3-R2 / R2-02）的操作顺序：
+        1. 需要时创建 .corrupt/（记录是否本次新建，供失败回滚）；
+        2. copy2 原文件到随机隐藏名 staging（``.<name>.<8hex>.tmp``）；
+        3. 用 ``os.link(staging → target)`` 的**独占创建**语义落成正式备份——
+           目标已存在时 link 抛 FileExistsError（原子，无「检查后替换」窗口）；
+        4. 候选名首次为 ``<name>.<stamp>.bak``，冲突后换
+           ``<name>.<stamp>-<6hex>.bak``，最多尝试 64 次；
+        5. 成功后先 unlink staging，最后才 unlink 原文件；只有全部成功才返回 target。
 
-        P1-Fix-3-R1（R1-03）：失败时尽最大努力回收**本次创建**的文件：
-        - copy2 失败：删 staging；
-        - rename 失败：删 staging；
-        - 原文件 unlink 失败：删本次的 target（历史备份不动），原文件保持完整；
-        - 本次创建的 .corrupt/ 若因此变空则 rmdir。
-        清理本身也可能失败（文件被占用等）。此时返回 None，并通过项目内
-        `.corrupt/` 里的残留文件如实暴露（不伪造零残留、不声称成功）。
-        操作开始前已存在的 .corrupt/ 文件与历史备份永远不动。
+        失败语义（任何一步抛 OSError，包括 64 次冲突耗尽、权限不足、文件系统
+        不支持硬链接）：删除本次**实际创建**的文件（staging，以及 link 成功的
+        target），本次新建的 .corrupt/ 若因此变空则 rmdir，最后返回 None。
+        target 只在 link 成功后进入回收集合，历史备份永远不会被误删或覆盖；
+        原文件在备份完整落盘之前保持原位。清理本身也可能失败（文件被占用等）——
+        此时同样返回 None，并通过 .corrupt/ 里的残留文件如实暴露
+        （不伪造零残留、不声称成功）。操作开始前已存在的 .corrupt/ 文件永远不动。
+
+        先前的实现是「copy2 → 随机 staging → rename 成 target」，rename 会覆盖
+        已存在的同名文件，极端时间戳冲突时会吞掉历史备份，已由上述 link 方案取代。
         """
         path = Path(path)
         root = self.project / ".corrupt"
         created_dir = not root.exists()
         staging = None
-        target = None
+        target = None          # 仅当本次成功 link 出 target 后才非 None（防误删历史文件）
         try:
             if not path.exists():
                 return None
             root.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            target = root / f"{path.name}.{stamp}.bak"
             staging = root / f".{path.name}.{uuid.uuid4().hex[:8]}{_TMP_SUFFIX}"
             shutil.copy2(path, staging)
-            staging.replace(target)
+            # 独占创建 target：os.link 在目标已存在时抛 FileExistsError，
+            # 不存在「检查后替换」的竞争窗口；冲突则换名重试。
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            for attempt in range(64):
+                candidate = (root / f"{path.name}.{stamp}.bak"
+                             if attempt == 0 else
+                             root / f"{path.name}.{stamp}-{uuid.uuid4().hex[:6]}.bak")
+                try:
+                    os.link(staging, candidate)
+                    target = candidate
+                    break
+                except FileExistsError:
+                    continue          # 名称冲突：绝不能覆盖，换下一个候选名
+            if target is None:
+                raise OSError(
+                    f"无法为 {path.name} 生成唯一的备份文件名（.corrupt/ 已尝试 64 次）")
+            staging.unlink()
             staging = None
             path.unlink()
             return target
